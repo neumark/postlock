@@ -263,17 +263,17 @@ var mkTelepathy = function(websocket_url) {
             return state;
         }
         my.process_server_message = function(message, base_data) {
-            var pending_local_transactions = [];
+            var pending_local_transformations = [];
             for (var i = 0; i < base_data.local_transformation_stack.length; i++) {
                 if (base_data.local_transformation_stack[last_ack_index].id > message.last_client_message_id) {
-                    pending_local_transactions.push(base_data.local_transformation_stack[last_ack_index]);
+                    pending_local_transformations.push(base_data.local_transformation_stack[last_ack_index]);
                 }
             }
             base_data.local_transformation_stack = pending_local_transformations;
             // If there are local transformations which have not been
             // processed by the server, then current_local_state is not
             // modified.
-            if (pending_local_transactions.length == 0) {
+            if (pending_local_transformations.length == 0) {
                 // check if we need to fire update event.
                 if (!base_data.current_local_state.equals(message.parameters.value)) {
                     my.base.cb.fire_async("set",[base_data.current_local_state, message.parameters.value]);
@@ -311,32 +311,60 @@ var mkTelepathy = function(websocket_url) {
             process_server_message: my.process_server_message,
             apply_command: my.apply_command
         });
-        my.set = function(val, overwrite) {
+        my.set = function(key, val, overwrite) {
             var transformation = {
                 command: 'set',
                 parameters: {
+                    key: key,
                     value: val,
                     overwrite: overwrite
                 }
             };
             my.apply_local_transformation(transformation, val);
         };
+        my.remove = function(key) {
+            var transformation = {
+                command: 'remove',
+                parameters: {
+                    key: key,
+                }
+            };
+            my.apply_local_transformation(transformation, val);
+        };
         my.apply_command = function (transformation, state) {
-            // in this case its trivial:
-            return state;
+            var s = clone(state);
+            s[transformation.parameters.key] = transformation.parameters.value;
+            return s;
         }
         my.process_server_message = function(message, base_data) {
-            var pending_local_transactions = [];
+            // Is the transformation related to a key which is modified on the local transformation stack?
+            //  No:  CASE 1: Update last_shared_state, current_local_state & fire events.
+            //  Yes: Have the pending transformations related to the key been processed by the server?
+            //       No:  CASE 2: Update last_shared_state
+            //       Yes: Is the latest pending event a duplicate of the received server command?
+            //            Yes: CASE 3: update last_shared_state, local_transformation_stack
+            //            No:  CASE 4: update last_shared_state, current_local_state & fire events.
+            var acknowledged_pending_transformations_on_key = [];
+            var unacknowledged_pending_transformations_on_key = [];
+
             for (var i = 0; i < base_data.local_transformation_stack.length; i++) {
-                if (base_data.local_transformation_stack[last_ack_index].id > message.last_client_message_id) {
-                    pending_local_transactions.push(base_data.local_transformation_stack[last_ack_index]);
+                if (base_data.local_transformation_stack[i].parameters.key !== message.parameters.key) continue;
+                if (base_data.local_transformation_stack[i].id <= message.last_client_message_id) {
+                    acknowledged_pending_transformations_on_key.push(i);
+                } else {
+                    unacknowledged_pending_transformations_on_key.push(i);
                 }
+            }
+            if (acknowledged_pending_transformations_on_key.length == 0 && 
+                unacknowledged_pending_transformations_on_key.length == 0) {
+                // CASE 1
+                my.base.cb.fire_async("set",[message.parameters.key, base_data.current_local_state[message.parameters.key], message.parameters.value]);
             }
             base_data.local_transformation_stack = pending_local_transformations;
             // If there are local transformations which have not been
             // processed by the server, then current_local_state is not
             // modified.
-            if (pending_local_transactions.length == 0) {
+            if (pending_local_transformations.length == 0) {
                 // check if we need to fire update event.
                 if (!base_data.current_local_state.equals(message.parameters.value)) {
                     my.base.cb.fire_async("set",[base_data.current_local_state, message.parameters.value]);
@@ -350,11 +378,23 @@ var mkTelepathy = function(websocket_url) {
         };
             
         return {
+            cb: my.base.cb,
             exports: {
-                set: function(val) {my.set(val,true);},
-                safe_set: function(val) {my.set(val,false);},
-                get: my.base.get_current_state,
-                set_cb: my.base.cb.set_user_cb
+                set: function(key,val) {my.set(key,val,true);},
+                safe_set: function(key,val) {my.set(key,val,false);},
+                get: function(key) {return my.base.get_current_state()[key];},
+                remove: my.remove,
+                set_cb: my.base.cb.set_user_cb,
+                keys: function() {
+                    var keys = [];
+                    var st = my.base.get_current_state();
+                    var k;
+                    for (k in st) {
+                        if st.hasOwnProperty(k) keys.push(k);
+                    }
+                    return keys;
+                },
+                size: function() {return my.base.get_current_state().length;}
             }
         };
     };

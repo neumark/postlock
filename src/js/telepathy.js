@@ -25,46 +25,44 @@ var mkTelepathy = function(websocket_url) {
     var args2array = function(args) {
         args = args || [];
         else return Array.prototype.slice.apply(args);
-    }
+    };
 
     var clone = function(state) {
         // NOTE: this is the worst solution performance-wise!
         return JSON.decode(JSON.encode(state));
-    }
+    };
 
     var copy_methods = function(src, dest) {
         for (var i in src) dest[i] = src[i];
         return dest;
-    }
+    };
+
+    var get_timestamp = function() { return +new Date(); };
 
     // from: http://stackoverflow.com/questions/1068834/object-comparison-in-javascript
-    Object.prototype.equals = function(x) {
-        for(p in this) {
+    var equals = function(t,x) {
+        for(p in t) {
             if(typeof(x[p])=='undefined') {return false;}
         }
-        for(p in this) {
-            if (this[p]) {
-                switch(typeof(this[p])) {
+        for(p in t) {
+            if (t[p]) {
+                switch(typeof(t[p])) {
                 case 'object':
-                        if (!this[p].equals(x[p])) { return false }; break;
+                        if (!equals(t[p],x[p])) { return false }; break;
                 case 'function':
-                        if (typeof(x[p])=='undefined' || (p != 'equals' && this[p].toString() != x[p].toString())) { return false; }; break;
+                        if (typeof(x[p])=='undefined' || (p != 'equals' && t[p].toString() != x[p].toString())) { return false; }; break;
                 default:
-                        if (this[p] != x[p]) { return false; }
+                        if (t[p] != x[p]) { return false; }
                 }
-            }
-            else {
-                if (x[p]) {
-                    return false;
-                }
+            } else { 
+            if (x[p]) { return false; }
             }
         }
         for(p in x) {
-            if(typeof(this[p])=='undefined') {return false;}
+            if(typeof(t[p])=='undefined') {return false;}
         }
         return true;
-    }
-     
+    };
 
     var mkCounter = function () {
     // From Javascript - The Good Parts
@@ -85,6 +83,12 @@ var mkTelepathy = function(websocket_url) {
             },
             gensym: function (  ) {
                 var result = prefix + seq;
+                seq += 1;
+                return result;
+            },
+            // Note: disregards prefix.
+            getint: function() {
+                var result = seq + 0;
                 seq += 1;
                 return result;
             }
@@ -138,7 +142,7 @@ var mkTelepathy = function(websocket_url) {
             remove_internal_cb: function(signal) { delete my.internal_cb[signal];},
             remove_user_cb: function(signal) { delete my.user_cb[signal];},
             fire: my.fire, 
-            fire_async: function(signal, args) {setTimeout(function() {my.fire(signal, args);}, 10);},
+            fire_async: function(signal, args) {setTimeout(function() {my.fire(signal, args);}, 4);},
             // used when we need a function which fires a signal. For example,
             // ajax-based callbacks or ws calls.
             wrap_signal: function(signal) {
@@ -163,8 +167,8 @@ var mkTelepathy = function(websocket_url) {
         // spec format: {
         //      string oid: (optional)
         //      string type: "dict" || "list" || "data" (mandatory)
-        //      function: process_server_message
-        //      fucntion: apply_command
+        //      object fun, where:
+        //      fucntion: fun.remote_transformation
         // }
         var object_id = spec.oid || telepathy_shared.counters.object_id.gensym();
 
@@ -172,65 +176,66 @@ var mkTelepathy = function(websocket_url) {
         var my {
             // unique ID of object
             oid: object_id,
-            // the last state which the server and client could agree on
-            // for the current object
-            // last_shared_state has form:
-            // {
-            //      opaque: data - state data of object
-            //      string: hash - hash of contents of data
-            // }
-            last_shared_state: {
-                server_message_id: 0,
-                state: null
-            },
+            last_server_message_id: 0, 
             // current_local_state is the state according to the local client.
             // all local gets and sets are applied to this state.
-            current_local_state: null,
-            // local_stransformation_stack is the list of operations committed
-            // locally not yet acknowledged by the server.
-            //      transformation: {
-            //                          string: command
-            //                          opaque: parameters
-            //                      }
-            local_transformation_stack: [],
+            current_local_state: spec.state || null,
             // callback manager, which is shared with the descendant object
             cb: mkCallbackManager({name: spec.type+"#"+object_id}),
             // parent node
             parent_node: null,
-            // default OT function is 'do nothing':
-            process_server_message: spec.process_server_message,
-            apply_command: spec.apply_command
         };
 
         my.cb.set_internal_cb("server_message", function(message) {
-            return my.process_server_message(message, my);});
+            // update last server mesasge id:
+            my.last_server_message_id = message.header.id;
+            // if this object needs to be deleted, do it here
+            if (message.header.action === 'e' && message.body.command === 'delete') {
+                // TODO: We should check if this object is attached to a list/dict
+                // and throw an execption if so (if parent_node !== null).
+                delete telepathy_shared.master_dict[my.oid];
+                // fire callback
+                my.cb.fire("delete", message);
+                return;
+            }
+            return spec.fun.remote_transformation(message);
+        });
 
         // EXPORTS
         return {
             cb: my.cb,
-            get_oid: function() {return my.oid+'';},
-            get_type: function() {return spec.type+'';},
-            get_parent: function() {return parent_node+'';},
-            get_current_state: function() {
-                return clone(my.current_local_state);
+            get_current_state: function() { return my.current_local_state; },
+            update_current_state: function(newstate, transformation) {
+                var oldstate = clone(my.current_local_state);
+                my.current_local_state = newstate;
+                if (!equals(my.current_local_state,newstate)) {
+                    my.cb.async_fire(transformation.body.command, [oldstate, newstate, transformation]);
+                }
             },
-            apply_local_transformation: function(transformation) {
-                // transformation should be: {
-                //      command: CMD,
-                //      parameters: CMD PARAMS,
-                // }
-                var t = clone(transformation);
-                // We extend transformation with:
-                // ID
-                // timestamp
-                t.id = telepathy_shared.counters.client_msg_id.gensym();
-                t.ts = +new Date();
-                my.local_transformation_stack.push(t);
-                my.current_local_state = my.apply_command(t,clone(my.current_local_state));
-                // send transformation to server
-                telepathy_shared.connection.send(JSON.stringify(t));
-                // fire transformation events
-                my.cb.fire(t.command, t.parameters);
+            set_parent: function (newparent) {my.parent_node = newparent;},
+            get_last_server_message_id: function() {return my.last_server_message_id + 0;},
+            create_transformation: function(action, command, parameters) {
+                return {
+                    header: {
+                        id: telepathy_shared.counters.client_msg_id.getint(),
+                        last_server_message_id: my.last_server_message_id,
+                        action: action,
+                        oid: my.oid,
+                        ts: {
+                            applied:  get_timestamp()
+                        },
+                    body: {
+                        command: command,
+                        parameters: parameters
+                    }
+                };
+            },
+            exports: {
+                get_oid: function() {return my.oid+'';},
+                get_type: function() {return spec.type+'';},
+                get_parent: function() {return my.parent_node+'';},
+                set_cb: my.cb.set_user_cb,
+                toString: function() {return "Telepathy object (oid: "+my.oid+" type: "+spec.type+")";}
             }
         };
     };
@@ -239,165 +244,191 @@ var mkTelepathy = function(websocket_url) {
     var mkData = function(spec) {
         // MODULE FIELDS:
         var my = {
-            process_server_message: null,
-            apply_command: null
-        }
+            // pending set (only the last pending set is of interest):
+            pending_local_transformation: null,
+            // fun is used by the base class's callback for 'server_message'
+            fun: {}
+        };
         my.base = mkTelepathyObject({
             oid: spec.oid, 
+            state: spec.state,
             type: 'data',
-            process_server_message: my.process_server_message,
-            apply_command: my.apply_command
+            fun: my.fun
         });
-        my.set = function(val, overwrite) {
-            var transformation = {
-                command: 'set',
-                parameters: {
-                    value: val,
-                    overwrite: overwrite
-                }
-            };
-            my.apply_local_transformation(transformation, val);
-        };
-        my.apply_command = function (transformation, state) {
-            // in this case its trivial:
-            return state;
-        }
-        my.process_server_message = function(message, base_data) {
-            var pending_local_transformations = [];
-            for (var i = 0; i < base_data.local_transformation_stack.length; i++) {
-                if (base_data.local_transformation_stack[last_ack_index].id > message.last_client_message_id) {
-                    pending_local_transformations.push(base_data.local_transformation_stack[last_ack_index]);
-                }
+
+        my.fun.remote_transformation = function(message) {
+            // If pending_local_transformation has been processed by
+            // the server, then update local state. Otherwise do nothing.
+            if (pending_local_transformation 
+                && pending_local_transformation.header.id 
+                    <= message.header.last_client_message_id) {
+                    my.base.update_current_state(message.parameters.value, message);
             }
-            base_data.local_transformation_stack = pending_local_transformations;
-            // If there are local transformations which have not been
-            // processed by the server, then current_local_state is not
-            // modified.
-            if (pending_local_transformations.length == 0) {
-                // check if we need to fire update event.
-                if (!base_data.current_local_state.equals(message.parameters.value)) {
-                    my.base.cb.fire_async("set",[base_data.current_local_state, message.parameters.value]);
-                }
-            } 
-            // update last_shared_state
-            base_data.last_shared_state = {
-                server_message_id: message.id,
-                state: local_state
-            };
         };
-            
-        return {
+
+        my.fun.set = function(val, overwrite) {
+            if (val === my.base.get_current_state()) return;
+            var t = my.base.create_transformation('m', 'set', {
+                value: val,
+                overwrite: overwrite
+            }); 
+            my.pending_local_transformation = t;
+            telepathy_shared.execute(t);
+        };
+        
+        var ret = {
+            cb: my.base.cb,
             exports: {
                 set: function(val) {my.set(val,true);},
                 safe_set: function(val) {my.set(val,false);},
-                get: my.base.get_current_state,
+                get: function() {return clone(my.base.get_current_state());},
                 set_cb: my.base.cb.set_user_cb
             }
         };
+        copy_methods(my.base.exports, ret.exports);
+        return ret;
     };
-
-
 
     // Dict module for telepathy dict nodes.
     var mkDict = function(spec) {
         // MODULE FIELDS:
         var my = {
-            process_server_message: null,
-            apply_command: null
+            fun: {
+                to_internal_key: function(v) {return "entry_" + v;},
+                from_internal_key: function(v) {return v.slice(6);},
+            },
+            pending_transactions: {}
         }
         my.base = mkTelepathyObject({
             oid: spec.oid, 
             type: 'dict',
-            process_server_message: my.process_server_message,
-            apply_command: my.apply_command
+            fun: my.fun,
         });
-        my.set = function(key, val, overwrite) {
-            var transformation = {
-                command: 'set',
-                parameters: {
-                    key: key,
-                    value: val,
-                    overwrite: overwrite
-                }
+        my.fun.existing_parent_ex(val)  {
+            throw {
+                message: "Telepathy object cannot be attached to dictionary while attached to another object"
             };
-            my.apply_local_transformation(transformation, val);
         };
-        my.remove = function(key) {
-            var transformation = {
-                command: 'remove',
-                parameters: {
-                    key: key,
-                }
-            };
-            my.apply_local_transformation(transformation, val);
-        };
-        my.apply_command = function (transformation, state) {
-            var s = clone(state);
-            s[transformation.parameters.key] = transformation.parameters.value;
-            return s;
-        }
-        my.process_server_message = function(message, base_data) {
-            // Is the transformation related to a key which is modified on the local transformation stack?
-            //  No:  CASE 1: Update last_shared_state, current_local_state & fire events.
-            //  Yes: Have the pending transformations related to the key been processed by the server?
-            //       No:  CASE 2: Update last_shared_state
-            //       Yes: Is the latest pending event a duplicate of the received server command?
-            //            Yes: CASE 3: update last_shared_state, local_transformation_stack
-            //            No:  CASE 4: update last_shared_state, current_local_state & fire events.
-            var acknowledged_pending_transformations_on_key = [];
-            var unacknowledged_pending_transformations_on_key = [];
-
-            for (var i = 0; i < base_data.local_transformation_stack.length; i++) {
-                if (base_data.local_transformation_stack[i].parameters.key !== message.parameters.key) continue;
-                if (base_data.local_transformation_stack[i].id <= message.last_client_message_id) {
-                    acknowledged_pending_transformations_on_key.push(i);
-                } else {
-                    unacknowledged_pending_transformations_on_key.push(i);
-                }
+        my.fun.do_set = function(key, child_oid) {
+            // set newly acquired child's parent
+            // check if val's parent is null.
+            // if not, throw excpetion.
+            if (telepathy_shared.master_dict[child_oid].exports.get_parent() !== null) {
+                my.fun.existing_parent_ex(child_oid);
             }
-            if (acknowledged_pending_transformations_on_key.length == 0 && 
-                unacknowledged_pending_transformations_on_key.length == 0) {
-                // CASE 1
-                my.base.cb.fire_async("set",[message.parameters.key, base_data.current_local_state[message.parameters.key], message.parameters.value]);
-            }
-            base_data.local_transformation_stack = pending_local_transformations;
-            // If there are local transformations which have not been
-            // processed by the server, then current_local_state is not
-            // modified.
-            if (pending_local_transformations.length == 0) {
-                // check if we need to fire update event.
-                if (!base_data.current_local_state.equals(message.parameters.value)) {
-                    my.base.cb.fire_async("set",[base_data.current_local_state, message.parameters.value]);
-                }
-            } 
-            // update last_shared_state
-            base_data.last_shared_state = {
-                server_message_id: message.id,
-                state: local_state
-            };
+            telepathy_shared.master_dict[child_oid].set_parent(my.base.exports.get_oid());
+            var newstate = clone(my.base.get_current_state());
+            newstate[my.fun.to_internal_key(key)] = child_oid;
+            return newstate;
         };
-            
-        return {
-            cb: my.base.cb,
-            exports: {
-                set: function(key,val) {my.set(key,val,true);},
-                safe_set: function(key,val) {my.set(key,val,false);},
-                get: function(key) {return my.base.get_current_state()[key];},
-                remove: my.remove,
-                set_cb: my.base.cb.set_user_cb,
-                keys: function() {
-                    var keys = [];
-                    var st = my.base.get_current_state();
-                    var k;
-                    for (k in st) {
-                        if st.hasOwnProperty(k) keys.push(k);
+        my.fun.do_remove = function(key) {
+            var internal_key = my.fun.to_internal_key(key);
+            // update parent of newly removed item:
+            telepathy_shared.master_dict[my.base.get_current_state()[internal_key]].set_parent(null);
+            var newstate = clone(my.base.get_current_state());
+            if (internal_key in newstate) {
+                delete newstate[internal_key];
+            }
+            return newstate;
+        };
+        my.fun.set = function(key, val, overwrite) {
+            var newstate = my.fun.do_set(key, val.get_oid()); 
+            // create 'set' transformation
+            var transformation = my.base.create_transformation('m', 'set', {
+                key: key,
+                child_oid: val.get_oid(),
+                overwrite: overwrite
+            }); 
+            my.base.update_current_state(newstate, transformation);
+        };
+        my.fun.get = function(key) {
+            var k = my.fun.to_internal_key(key);
+            var st = my.base.get_current_state();
+            if ((k in st) &&
+                (st[k] in telepathy_shared.master_dict)) {
+                return telepathy_shared.master_dict[st[k]].exports;
+            } else return undefined; // throw exception instead?
+        };
+        my.fun.remove = function(key, force) {
+            // TODO: don't delete from master_dict, as safe_remove may fail.
+            // we'll worry about this later...
+            var transformation1 = my.base.create_transformation('m', 'remove', {
+                    key: key,
+                    force: force 
+                }
+            );
+            var newstate = my.fun.do_remove(key);
+            my.base.update_current_state(newstate, transformation1);
+            var transformation2 = my.base.create_transformation('e', 'delete', {
+                    key: key,
+                }
+            );
+            // execute the delete on the element we just removed.
+            telepathy_shared.execute(transformation2);
+        };
+        my.fun.keys = function() {
+            var keys = [];
+            var st = my.base.get_current_state();
+            var k;
+            for (k in st) {
+                if st.hasOwnProperty(k) keys.push(my.fun.from_internal_key(k));
+            }
+            return keys;
+        };
+        my.base.cb.set_internal_cb("delete", function() {
+            // delete all children as well
+            var keys = my.fun.keys();
+            for (var k = 0; k < keys.length; k++) {
+                var child_oid = my.base.cb.get_current_state()[k];
+                telepathy_shared.master_dict[child_oid].set_parent(null);
+                telepathy_shared.master_dict[child_oid].cb.fire_async("delete");
+            }
+        });
+       my.fun.remote_transformation = function(message) {
+       // dict-s can receive two transformations:
+       // set - due to another client's set, or the ack/nack this client's (safe)set
+       // remove - remove an element from the dictionary
+            var current_key = message.body.parameters.key;
+            var newstate;
+            switch(message.body.command) {
+                case "set":
+                    if (my.pending_transactions[my.fun.to_internal_key(current_key)].length == 0) {
+                        newstate = my.fun.do_set(current_key, message.body.parameters.child_oid);
+                    } else {
+                        // there are pending transformations on the current key
                     }
-                    return keys;
-                },
+                    break;
+                case "remove":
+                    if (my.pending_transactions[my.fun.to_internal_key(current_key)].length == 0) {
+                        newstate = my.fun.do_remove(current_key, message);
+                    } else {
+                        // there are pending transformations on the current key
+                    }
+                    break;
+                default:
+                    throw {
+                        msg: "bad remote transformation on dict"
+                        transformation: message
+                    };
+            };
+            my.base.update_current_state(newstate, message);
+       };
+            
+       var ret = {
+           cb: my.base.cb,
+           exports: {
+                get: my.fun.get,
+                set: function(key,val) {my.fun.set(key,val,true);},
+                safe_set: function(key,val) {my.fun.set(key,val,false);},
+                remove: function(key,val) {my.fun.remove(key,true);},
+                safe_remove: function(key,val) {my.fun.remove(key,false);},
+                keys: my.fun.keys, 
                 size: function() {return my.base.get_current_state().length;}
-            }
-        };
-    };
+           }
+       };
+       copy_methods(my.base.exports, ret.exports);
+       return ret;
+   };
 
 
 
@@ -504,6 +535,24 @@ var mkTelepathy = function(websocket_url) {
         };
         telepathy_shared.unregister_object = function(tobj) {
                 delete telepathy_shared.master_dict[tobj.exports.get_id()];
+        };
+        telepathy_shared.execute = function(transformation) {
+            telepathy_shared.outqueue.add(t);
+            telepathy_shared.outqueue.flush();
+            telepathy_shared.master_dict[transformation.header.oid].cb.fire_async(
+                transformation.body.command, t);
+        };
+        telepathy_shared.outqueue = [];
+        telepathy_shared.outqueue.add = function(t) {
+            t.header.ts.queued = get_timestamp();
+            telepathy_shared.outqueue.push(t);
+        };
+        telepathy_shared.outqueue.flush = function() {
+            while (telepathy_shared.outqueue.length > 0) {
+                var t = telepathy_shared.outqueue.shift();
+                telepathy_shared.connection.send(t);
+                t.header.ts.sent= get_timestamp();
+            }
         };
  
         // EXPORTS:

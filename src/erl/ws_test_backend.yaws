@@ -20,6 +20,8 @@ websocket_owner() ->
 		    case Messages of
 			[<<"client-connected">>] ->
 			    yaws_api:websocket_setopts(WebSocket, [{active, true}]),
+                io:format("echo server process: ~p~n", [self()]),
+                yaws_api:websocket_send(WebSocket, "{\"client_id\":\"1\"}"),
 			    echo_server(WebSocket);
 			Other ->
 			    io:format("websocket_owner got: ~p. Terminating~n", [Other])
@@ -32,11 +34,15 @@ echo_server(WebSocket) ->
     receive
 	{tcp, WebSocket, DataFrame} ->
 	    Data = yaws_api:websocket_unframe_data(DataFrame),
-	    io:format("Got data from Websocket: ~p~n", [Data]),
+	    io:format("Got data from Websocket: ~p~n", [json:decode_string(erlang:binary_to_list(Data))]),
             yaws_api:websocket_send(WebSocket, Data), 
             echo_server(WebSocket);
 	{tcp_closed, WebSocket} ->
 	    io:format("Websocket closed. Terminating echo_server...~n");
+    {send, ToBeSent} ->
+        io:format("Sending ~p~n", [ToBeSent]),
+        yaws_api:websocket_send(WebSocket, ToBeSent),
+        echo_server(WebSocket);
 	Any ->
 	    io:format("echo_server received msg:~p~n", [Any]),
 	    echo_server(WebSocket)

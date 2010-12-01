@@ -4,110 +4,145 @@
 */
 var debugvar;
 // mkTelepathy: constructor for the main telepathy module.
-var mkTelepathy = function(websocket_url) {
+var mkTelepathy = function (websocket_url) {
 
-    // shared state for all of telepathy
-    var telepathy_shared = {
+    // variable containing for all of telepathy
+    var TS = {
         config: {
             ws_url: websocket_url 
         },
         counters: {},
         master_dict: {},
-        transactions: {},
-        // ---- telepathy shared functions ----
-    
-        get_object: function(oid) {
-            return telepathy_shared.master_dict[oid];
-        }
-    };
-
-    // ---------------------
-    // - Utility functions -
-    // ---------------------
-
-    // From Javascript - The Good Parts
-    var is_array = function (value) {
-        return value &&
-            typeof value === 'object' &&
-            value.constructor === Array;
-    };
-       
-    var args2array = function(args) {
-        args = args || [];
-        return Array.prototype.slice.apply(args);
-    };
-
-    var throw_ex = function(message, extra_data) {
-        var e = new Error(message);
-        if (extra_data) e.data = extra_data;
-        throw e;
-    };
-
-    // from: http://stackoverflow.com/questions/122102/what-is-the-most-efficient-way-to-clone-a-javascript-object
-    var clone = function(from) {
-    if (from == null || typeof from != "object") return from;
-    if (from.constructor != Object && from.constructor != Array) return from;
-    if (from.constructor == Date || from.constructor == RegExp || from.constructor == Function ||
-        from.constructor == String || from.constructor == Number || from.constructor == Boolean)
-        return new from.constructor(from);
-    to = new from.constructor();
-    for (var name in from) {
-        to[name] = typeof to[name] == "undefined" ? this.extend(from[name], null) : to[name];
-    }
-    return to;
-    };
-
-    var copy_methods = function(src, dest) {
-        for (var i in src) dest[i] = src[i];
-        return dest;
-    };
-
-    var get_timestamp = function() { return +new Date(); };
-
-    var retry_until = function(condition, cb_success, cb_failure, num_retries, timeout) {
-        var ms = timeout || 10;
-        var retries = num_retries || 5;
-        var on_failure = cb_failure || function() {throw_ex("retry_until failed", {args: args2array(arguments)});};
-        var do_try = function(r) {
-            if (condition()) return cb_success();
-            else if (retries === 0) on_failure();
-            else {
-                setTimeout(function() {do_try(r-1);},ms);
-            }
-        };
-        do_try(retries);
-    }
-
-    // from: http://stackoverflow.com/questions/1068834/object-comparison-in-javascript
-    var equals = function(t,x) {
-        for(p in t) {
-            if(typeof(x[p])=='undefined') {return false;}
-        }
-        for(p in t) {
-            if (t[p]) {
-                switch(typeof(t[p])) {
-                case 'object':
-                        if (!equals(t[p],x[p])) { return false }; break;
-                case 'function':
-                        if (typeof(x[p])=='undefined' || (p != 'equals' && t[p].toString() != x[p].toString())) { return false; }; break;
-                default:
-                        if (t[p] != x[p]) { return false; }
+        transactions: {
+            local: {},
+            remote: {}
+        },
+        modules: {},
+        outqueue: [],
+        // ---------------------
+        // - Utility functions -
+        // ---------------------
+        util: {
+            get_object: function (oid) {
+                return TS.master_dict[oid];
+            },
+            get_transaction: function (tid) {
+                return TS.transactions[tid];
+            },
+            // from: http://www.javascriptkit.com/javatutors/arraysort.shtml
+            numeric_sort: function (a, b) {
+                return (a - b);
+            },
+            create_message: function (message_type) {
+                return {
+                    header: {
+                        id: TS.counters.client_message_id.getint(),
+                        last_server_message_id: TS.counters.last_server_message_id,
+                        message_type: message_type,
+                        ts: {
+                            created:  TS.util.get_timestamp()
+                        }
+                    }
+                };
+            },
+            // Assembles ack's for applied remote transactions
+            // based on the contents of TS.transactions.remote
+            prepare_acks_of_remote_transactions: function () {
+                var i, acknowledged_remote_transactions = [];
+                for (i in TS.transactions.remote) 
+                    if (TS.transactions.remote.hasOwnProperty(i)) {
+                        if (TS.transactions.remote[i].exports.get_current_status() === "acknowledged") {
+                            acknowledged_remote_transactions.push(parseInt(i));
+                            // remove this transactions from the list of remote t's.
+                            delete TS.transactions.remote[i];
+                        }
+                    }
                 }
-            } else { 
-            if (x[p]) { return false; }
+                acknowledged_remote_transactions.sort(TS.util.numeric_sort);
+                return acknowledged_remote_transactions;
+            },
+            // From Javascript - The Good Parts
+            is_array: function (value) {
+                return value &&
+                    typeof value === 'object' &&
+                    value.constructor === Array;
+            },
+            args2array: function (args) {
+                args = args || [];
+                return Array.prototype.slice.apply(args);
+            },
+            throw_ex: function (message, extra_data) {
+                var e = new Error(message);
+                if (extra_data) e.data = extra_data;
+                throw e;
+            },
+            is_transaction: function (t) {
+                return t.get_tid && typeof t.get_tid === "function";
+            },
+            // from: http://stackoverflow.com/questions/122102/what-is-the-most-efficient-way-to-clone-a-javascript-object
+            clone: function (from) {
+                if (from == null || typeof from != "object") return from;
+                if (from.constructor != Object && from.constructor != Array) return from;
+                if (from.constructor == Date || from.constructor == RegExp || from.constructor == Function ||
+                    from.constructor == String || from.constructor == Number || from.constructor == Boolean)
+                    return new from.constructor(from);
+                to = new from.constructor();
+                for (var name in from) {
+                    to[name] = typeof to[name] == "undefined" ? this.extend(from[name], null) : to[name];
+                }
+                return to;
+            },
+            copy_methods: function (src, dest) {
+                var i;
+                for (i in src) dest[i] = src[i];
+                return dest;
+            },
+            get_timestamp: function () { return +new Date(); },
+            retry_until: function (condition, cb_success, cb_failure, num_retries, timeout) {
+                var ms = timeout || 10, 
+                    retries = num_retries || 5,
+                    on_failure = cb_failure || function () {TS.util.throw_ex("retry_until failed", {args: TS.util.args2array(arguments)});},
+                    do_try = function (r) {
+                        if (condition()) return cb_success();
+                        else if (retries === 0) on_failure();
+                        else {
+                            setTimeout(function () {do_try(r-1);},ms);
+                        }
+                    };
+                do_try(retries);
+            },
+            // from: http://stackoverflow.com/questions/1068834/object-comparison-in-javascript
+            equals: function (t,x) {
+                for(p in t) {
+                    if(typeof(x[p])=='undefined') {return false;}
+                }
+                for(p in t) {
+                    if (t[p]) {
+                        switch(typeof(t[p])) {
+                        case 'object':
+                                if (!equals(t[p],x[p])) { return false }; break;
+                        case 'function':
+                                if (typeof(x[p])=='undefined' || (p != 'equals' && t[p].toString() != x[p].toString())) { return false; }; break;
+                        default:
+                                if (t[p] != x[p]) { return false; }
+                        }
+                    } else { 
+                    if (x[p]) { return false; }
+                    }
+                }
+                for(p in x) {
+                    if(typeof(t[p])=='undefined') {return false;}
+                }
+                return true;
             }
-        }
-        for(p in x) {
-            if(typeof(t[p])=='undefined') {return false;}
-        }
-        return true;
-    };
+        } // end TS.util
+    }; // end TS
 
     //  --------------------
     //  - INTERNAL MODULES -
     //  --------------------
 
-    var mkCounter = function () {
+    TS.modules.mkCounter = function () {
     // From Javascript - The Good Parts
     // Produce an object that produces unique strings. A
     // unique string is made up of two parts: a prefix
@@ -118,7 +153,7 @@ var mkTelepathy = function(websocket_url) {
         var prefix = '';
         var seq = 0;
         return {
-            get_prefix: function() {return prefix + '';},
+            get_prefix: function () {return prefix + '';},
             set_prefix: function (p) {
                 prefix = String(p);
             },
@@ -131,7 +166,7 @@ var mkTelepathy = function(websocket_url) {
                 return result;
             },
             // Note: disregards prefix.
-            getint: function() {
+            getint: function () {
                 var result = seq + 0;
                 seq += 1;
                 return result;
@@ -141,7 +176,7 @@ var mkTelepathy = function(websocket_url) {
 
     // CallbackManager: Module responsible for getting/setting/calling
     // callback functions.
-    var mkCallbackManager = function(spec) {
+    TS.modules.mkCallbackManager = function (spec) {
         // format of spec:
         // {
         //      string name (optional)
@@ -157,14 +192,14 @@ var mkTelepathy = function(websocket_url) {
             // user-defined callbacks
             user_cb: {},
             // default callback function:
-            default_callback: function(signal, args) {
+            default_callback: function (signal, args) {
                 if (my.debug) {
                     console.log("Callback manager for " + my.id + " received signal " + signal + " with arguments " + args + ".");
                 }
             },
             fire: function (signal, args) {
                 // apply the internal callback first
-                var args_array = args2array(args);
+                var args_array = TS.util.args2array(args);
                 var first_cb;
                 if (signal in my.internal_cb) first_cb = my.internal_cb[signal];
                 else {
@@ -179,19 +214,19 @@ var mkTelepathy = function(websocket_url) {
 
         // MODULE EXPORTS
         return {
-            debug: function(new_debug_state) {my.debug = new_debug_state;},
-            set_internal_cb: function(signal, handler) {my.internal_cb[signal] = handler;},
-            get_internal_cb: function(signal) {return my.internal_cb[signal];},
-            set_user_cb: function(signal, handler) {my.user_cb[signal] = handler;},
-            get_user_cb: function(signal) {return my.user_cb[signal];},
-            remove_internal_cb: function(signal) { delete my.internal_cb[signal];},
-            remove_user_cb: function(signal) { delete my.user_cb[signal];},
+            debug: function (new_debug_state) {my.debug = new_debug_state;},
+            set_internal_cb: function (signal, handler) {my.internal_cb[signal] = handler;},
+            get_internal_cb: function (signal) {return my.internal_cb[signal];},
+            set_user_cb: function (signal, handler) {my.user_cb[signal] = handler;},
+            get_user_cb: function (signal) {return my.user_cb[signal];},
+            remove_internal_cb: function (signal) { delete my.internal_cb[signal];},
+            remove_user_cb: function (signal) { delete my.user_cb[signal];},
             fire: my.fire, 
-            fire_async: function(signal, args) {setTimeout(function() {my.fire(signal, args);}, 4);},
+            fire_async: function (signal, args) {setTimeout(function () {my.fire(signal, args);}, 4);},
             // used when we need a function which fires a signal. For example,
             // ajax-based callbacks or ws calls.
-            wrap_signal: function(signal) {
-                return function() {my.fire(signal, arguments);}
+            wrap_signal: function (signal) {
+                return function () {my.fire(signal, arguments);}
             } 
         };
     };
@@ -199,9 +234,10 @@ var mkTelepathy = function(websocket_url) {
    
     // Creates a transaction, which can be applied locally and sent to the
     // server.
-    var mkTransaction = function(spec) {
+    TS.modules.mkTransaction = function (spec) {
+        spec = spec || {};
         var my = {
-            msg: telepathy_shared.create_message('t'), // a message of type t = transaction 
+            msg: TS.util.create_message('t'), // a message of type t = transaction 
             // transaction status-es:
             // init - transaction is under composition
             // applying
@@ -209,27 +245,28 @@ var mkTelepathy = function(websocket_url) {
             // acknowledged - the transaction has been acknowledged
             // aborting
             // aborted - the transaction has been rolled back
-            current_status: "init"
+            current_status: "init",
+            is_remote: spec.is_remote || false
         };
 
         my.msg.transformations = [];
 
-        my.get_tid = function() {return my.msg.header.id+0;};
+        my.get_tid = function () {return my.msg.header.id+0;};
 
-        my.make_t_map = function() {
+        my.make_t_map = function () {
             // rearrange transformation list into an
             // object id -> list of commands map.
             var t_map = {};
             var i;
             for (i = 0; i < my.msg.transformations; i++) {
-                var oid = my.msg.transformations[i].oid || "none";
+                var oid = my.msg.transformations[i].oid || "meta_object";
                 if (!(oid in t_map)) t_map[oid] = [];
                 t_map.oid.push(my.msg.transformations[i]);
             }
             return t_map;
         };
 
-        my.rollback = function() {
+        my.rollback = function () {
             my.current_status = "aborting";
             var t_map = arguments[0] || my.make_t_map();
             var e = arguments[1] || {message: "no reason given", data: {}};
@@ -237,29 +274,21 @@ var mkTelepathy = function(websocket_url) {
             var i;
             for (i in t_map) {
                 if (!t_map.hasOwnProperty(i)) continue;
-                if (i === "none") {
-                    telepathy_shared.rollback_transaction(my.get_tid());
-                    continue;
-                }
-                telepathy_shared.get_object(i).rollback_transaction(my.get_tid());
+                TS.util.get_object(i).rollback_transaction(my.get_tid());
             }
             my.current_status = "aborted";
             // unregister transaction
-            delete telepathy_shared.transactions[my.get_tid()];
+            delete TS.transactions[my.get_tid()];
         };
 
-        my.apply_locally = function() {
+        my.apply_locally = function () {
            // apply transformations like 'create' which are not tied to an oid
             var i;
             var t_map = my.make_t_map();
             try {
                 for (i in t_map) {
                     if (!t_map.hasOwnProperty(i)) continue;
-                    if (i === "none") {
-                        telepathy_shared.apply_transaction(my.get_tid(), t_map.none);
-                        continue;
-                    }
-                    telepathy_shared.get_object(i).apply_transaction(my.get_tid(), t_map[i]);
+                    TS.util.get_object(i).apply_transaction(my.get_tid(), t_map[i]);
                 }
                 my.current_status = "applied";
                 return true;
@@ -268,47 +297,49 @@ var mkTelepathy = function(websocket_url) {
             }
             return false;
         };
-        my.send = function() {
-            telepathy_shared.outqueue.add(my.msg);
+        my.send = function () {
+            TS.outqueue.add_transaction(my.msg);
         };
-        my.apply = function() {
+        my.apply = function () {
             my.current_status = "applying";
-            if (my.apply_locally()) my.send();
+            if (my.apply_locally()) {
+                if (my.is_remote === true) my.current_status = my.ack;
+                else my.send();
+                return true;
+            }
+            return false;
         };
-        my.ack = function() {
+        my.ack = function () {
             my.current_status = "acknowledged";
             var t_map = my.make_t_map();
             for (i in t_map) {
                 if (!t_map.hasOwnProperty(i)) continue;
-                if (i === "none") {
-                    telepathy_shared.apply_transaction(my.get_tid(), t_map.none);
-                    continue;
-                }
-                if (t_map.hasOwnProperty(i)) telepathy_shared.get_object(i).ack_transaction(my.get_tid());
+                TS.util.get_object(i).ack_transaction(my.get_tid());
             }
             // unregister transaction
-            delete telepathy_shared.transactions[my.get_tid()];
+            delete TS.transactions.local[my.get_tid()];
         };
         // RETURN EXPORTS
         var ret = {
-            set_current_state: function(new_status) {my.current_status = new_status;},
-            get_transformations: function() {return my.transformations;},
+            set_current_state: function (new_status) {my.current_status = new_status;},
+            get_transformations: function () {return my.transformations;},
             ack: my.ack,
             rollback: my.rollback,
+            is_remote: function () {return my.is_remote == true;},
             exports: {
-                add_transformation: function(t) {
+                add_transformation: function (t) {
                     if (my.current_status !== "init") {
-                        throw_ex("add_transformation failed: transaction not in init state", t);
+                        TS.util.throw_ex("add_transformation failed: transaction not in init state", t);
                     }
                     my.msg.transformations.push(t);
                 },
                 get_tid: my.get_tid,
-                get_current_status: function() {return my.current_status+"";},
+                get_current_status: function () {return my.current_status+"";},
                 apply: my.apply
             }
         };
         // register this transaction
-        telepathy_shared.transactions[my.get_tid()] = ret;
+        TS.transactions[((my.is_remote==="true")?'remote':'local')][my.get_tid()] = ret;
         return ret;
     };
 
@@ -324,7 +355,7 @@ var mkTelepathy = function(websocket_url) {
     // - receive server messages, forward these signals to handlers
     // - place local state modification commands in queue
     // - resolve discrepancies in client/server state (this is the BIG issue)
-    var mkTelepathyObject = function (spec) {
+    TS.modules.mkTelepathyObject = function (spec) {
         // spec format: {
         //      string oid: (optional)
         //      string type: "dict" || "list" || "data" (mandatory)
@@ -334,25 +365,25 @@ var mkTelepathy = function(websocket_url) {
         var object_id = spec.oid;
         if (!object_id) {
             // throw exception if connection is not alive yet
-            if (telepathy_shared.counters.object_id.get_prefix().length == 0) throw_ex("telepathy not yet connected!", {spec: spec}); 
-            object_id = telepathy_shared.counters.object_id.gensym();
+            if (TS.counters.object_id.get_prefix().length == 0) TS.util.throw_ex("telepathy not yet connected!", {spec: spec}); 
+            object_id = TS.counters.object_id.gensym();
         }
         // MODULE DATA:
         var my = {
             // unique ID of object
             oid: object_id,
             // callback manager, which is shared with the descendant object
-            cb: spec.cb || mkCallbackManager({name: spec.type+"#"+object_id}),
+            cb: spec.cb || TS.modules.mkCallbackManager({name: spec.type+"#"+object_id}),
         };
         // --- callbacks ---
-        my.cb.set_internal_cb("server_message", function(message) {
+        my.cb.set_internal_cb("server_message", function (message) {
             // update last server mesasge id:
-            telepathy_shared.counters.last_server_message_id = message.header.id;
+            TS.counters.last_server_message_id = message.header.id;
             // if this object needs to be deleted, do it here
             if (message.header.action === 'e' && message.body.command === 'delete') {
                 // TODO: We should check if this object is attached to a list/dict
                 // and throw an execption if so (if parent_node !== null).
-                delete telepathy_shared.master_dict[my.oid];
+                delete TS.master_dict[my.oid];
                 // fire callback
                 my.cb.fire("delete", message);
                 return;
@@ -362,23 +393,23 @@ var mkTelepathy = function(websocket_url) {
         // --- transaction handling ---
         // call the specialized functions which do the actual work, then
         // fire the callbacks
-        my.apply_transaction = function(tid, transformations) {
+        my.apply_transaction = function (tid, transformations) {
                 spec.fun.transformations.apply(tid, transformations);
-                my.cb.fire("apply_transaction", {tid: tid, transformations: transformations});
+                my.cb.fire("apply_transaction", [tid, transformations]);
         };
-        my.ack_transaction = function(tid) {
+        my.ack_transaction = function (tid) {
                 spec.fun.transformations.ack(tid);
                 my.cb.fire("ack_transaction", {tid: tid});
         };
-        my.rollback_transaction = function(tid) {
+        my.rollback_transaction = function (tid) {
                 spec.fun.transformations.rollback(tid);
                 my.cb.fire("rollback_transaction", {tid: tid});
         };
 
         // EXPORTS
         my.exports = {
-                get_oid: function() {return my.oid+'';},
-                get_type: function() {return spec.type+'';},
+                get_oid: function () {return my.oid+'';},
+                get_type: function () {return spec.type+'';},
                 set_cb: my.cb.set_user_cb,
             };
         my.transactions = {
@@ -388,23 +419,40 @@ var mkTelepathy = function(websocket_url) {
             };
         return {
             cb: my.cb,
-            finish_object: function(desc) {
-                copy_methods(my.exports, desc.exports);
-                copy_methods(my.transactions, desc.transactions);
+            finish_object: function (desc) {
+                desc.exports = desc.exports || {};
+                desc.transactions = desc.transactions || {};
+                TS.util.copy_methods(my.exports, desc.exports);
+                TS.util.copy_methods(my.transactions, desc.transactions);
                 // add object to master_dict
-                telepathy_shared.master_dict[desc.exports.get_oid()] = desc;
-                // if necessary, create transaction
-                if (!spec.local_only || spec.local_only === false) {
-                    spec.transaction = spec.transaction || mkTransaction();
-                    spec.transaction.add_command(
-                        telepathy_shared.get_object("meta_object").create_command(
+                TS.master_dict[desc.exports.get_oid()] = desc;
+                // if necessary, add 'create' transaction
+                spec.transaction = spec.transaction || TS.modules.mkTransaction();
+                if (spec.is_remote !== true) {
+                    spec.transaction.exports.add_transformation(
+                        TS.util.get_object("meta_object").create_transformation(
                             'create', 
-                            {type: spec.type, oid: my.oid}));
-                    spec.transaction.apply();
+                            {
+                                type: spec.type, 
+                                oid: my.oid,
+                            }));
+                    spec.transaction.exports.apply();
                 }
                 return desc;
             },
-            create_command: function(command, parameters) {
+            require_local_transaction: function (fun, args) {
+                // there may be a transaction in the arguments
+                var t = args[args.length-1];
+                var apply_t = false;
+                if (!is_transaction(t)) {
+                    apply_t = true;
+                    t = mkTransaction();
+                }
+                fun(t, args);
+                if (apply_t) t.exports.apply();
+                return t;
+            },
+            create_transformation: function (command, parameters) {
                 return {
                     oid: my.oid,
                     command: command,
@@ -416,26 +464,41 @@ var mkTelepathy = function(websocket_url) {
 
     // Metaobject is the telepathy object that gets invoked if
     // no object id is given for a transaction (eg: object creation).
-    var mkMetaObject = function(spec) {
+    TS.modules.mkMetaObject = function (spec) {
         var my = {
-            base: mkTelepathyObject({
+            unacked_objects: {},
+            pending_transactions: {},
+            base: TS.modules.mkTelepathyObject({
+                    transaction: spec.transaction,
                     oid: "meta_object", 
                     type: "meta",
                     fun: {
                         transactions: {
-                            ack: function(tid) {
+                            ack: function (tid) {
                             },
-                            rollback: function(tid) {
+                            rollback: function (tid) {
                             },
-                            apply: function(tid, transformations) {
+                            apply: function (tid, transformations) {
+                                // objects are added to master_dict when they are created,
+                                // so apply simply adds them to unacked_objects if tid is local.
+                                if (!TS.get_transaction(tid).is_remote()){ 
+                                    for (var i = 0; i < transformations.length; i++) {
+                                        // if the transaction is local, add newly created object to
+                                        // pending objects
+                                        if (transformations[i].command === "create") {
+                                            my.unacked_objects[transformations[i].oid] = tid;
+                                            if (!(tid in my.pending_transactions)) my.pending_transactions[tid] = [];
+                                            my.pending_transactions[tid].push(transformations[i].oid);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    local_only: true
-                });
+                })
         };
         var ret = {
-            create_command: function(command, parameters) {
+            create_transformation: function (command, parameters) {
                 return {
                     command: command,
                     parameters: parameters
@@ -448,94 +511,84 @@ var mkTelepathy = function(websocket_url) {
    };
  
     // Data module for telepathy data nodes.
-    var mkData = function(spec) {
+    TS.modules.mkData = function (spec) {
         // MODULE FIELDS:
+        var fun = {};
         var my = {
-            // pending set (only the last pending set is of interest):
-            pending_local_transformation: null,
+            current_state: null,
             // fun is used by the base class's callback for 'server_message'
-            fun: {}
-        };
-        my.base = mkTelepathyObject({
-            oid: spec.oid, 
-            state: spec.state,
-            type: 'data',
-            fun: my.fun
-        });
-
-        my.fun.remote_transformation = function(message) {
-            // If pending_local_transformation has been processed by
-            // the server, then update local state. Otherwise do nothing.
-            if (pending_local_transformation 
-                && pending_local_transformation.header.id 
-                    <= message.header.last_client_message_id) {
-                    my.base.update_current_state(message.parameters.value, message);
-            }
+            fun: {},
+            base: TS.modules.mkTelepathyObject({
+                oid: spec.oid, 
+                state: spec.state,
+                type: 'data',
+                fun: fun
+            }),
+            fun: fun
         };
 
-        my.fun.set = function(val, overwrite) {
-            if (val === my.base.get_current_state()) return;
-            var t = my.base.create_transaction('m', 'set', {
-                value: val,
-                overwrite: overwrite
-            }); 
-            my.pending_local_transformation = t;
-            telepathy_shared.execute(t);
+        my.fun.set = function (val, overwrite) {
+            return my.base.require_local_transaction(
+                function (t) {
+                    t.add_command(
+                        my.base.create_transformation(
+                            'set',
+                            {value: val, overwrite: overwrite}))},
+                arguments);
         };
         
         var ret = {
             cb: my.base.cb,
             exports: {
-                set: function(val) {my.fun.set(val,true);},
-                safe_set: function(val) {my.fun.set(val,false);},
-                get: function() {return clone(my.base.get_current_state());},
+                set: function (val) {my.fun.set(val,true);},
+                safe_set: function (val) {my.fun.set(val,false);},
+                get: function () {return clone(my.current_state);},
             },
-            transactions: {}
         };
-        return return_telepathy_object(spec, my.base, ret);
+        return my.base.finish_object(ret);
    };
 
     // Dict module for telepathy dict nodes.
-    var mkDict = function(spec) {
+    TS.modules.mkDict = function (spec) {
         // MODULE FIELDS:
         var my = {
             fun: {
-                to_internal_key: function(v) {return "entry_" + v;},
-                from_internal_key: function(v) {return v.slice(6);},
+                to_internal_key: function (v) {return "entry_" + v;},
+                from_internal_key: function (v) {return v.slice(6);},
             },
             pending_transactions: {}
         }
-        my.base = mkTelepathyObject({
+        my.base = TS.modules.mkTelepathyObject({
             oid: spec.oid, 
             type: 'dict',
             fun: my.fun,
         });
-        my.fun.existing_parent_ex = function(val) {
-            throw_ex("Telepathy object cannot be attached to dictionary while attached to another object");
+        my.fun.existing_parent_ex = function (val) {
+            TS.util.throw_ex("Telepathy object cannot be attached to dictionary while attached to another object");
         };
-        my.fun.do_set = function(key, child_oid) {
+        my.fun.do_set = function (key, child_oid) {
             // set newly acquired child's parent
             // check if val's parent is null.
             // if not, throw excpetion.
-            if (telepathy_shared.master_dict[child_oid].exports.get_parent() !== null) {
+            if (TS.master_dict[child_oid].exports.get_parent() !== null) {
                 my.fun.existing_parent_ex(child_oid);
             }
-            telepathy_shared.master_dict[child_oid].set_parent(my.base.exports.get_oid());
+            TS.master_dict[child_oid].set_parent(my.base.exports.get_oid());
             var newstate = clone(my.base.get_current_state());
             newstate[my.fun.to_internal_key(key)] = child_oid;
             return newstate;
         };
-        my.fun.do_remove = function(key) {
+        my.fun.do_remove = function (key) {
             var internal_key = my.fun.to_internal_key(key);
             // update parent of newly removed item:
-            telepathy_shared.master_dict[my.base.get_current_state()[internal_key]].set_parent(null);
+            TS.master_dict[my.base.get_current_state()[internal_key]].set_parent(null);
             var newstate = clone(my.base.get_current_state());
             if (internal_key in newstate) {
                 delete newstate[internal_key];
             }
             return newstate;
         };
-        my.fun.set = function(key, val, overwrite) {
+        my.fun.set = function (key, val, overwrite) {
             var newstate = my.fun.do_set(key, val.get_oid()); 
             // create 'set' transformation
             var transformation = my.base.create_transaction('m', 'set', {
@@ -545,15 +598,15 @@ var mkTelepathy = function(websocket_url) {
             }); 
             my.base.update_current_state(newstate, transformation);
         };
-        my.fun.get = function(key) {
+        my.fun.get = function (key) {
             var k = my.fun.to_internal_key(key);
             var st = my.base.get_current_state();
             if ((k in st) &&
-                (st[k] in telepathy_shared.master_dict)) {
-                return telepathy_shared.master_dict[st[k]].exports;
+                (st[k] in TS.master_dict)) {
+                return TS.master_dict[st[k]].exports;
             } else return undefined; // throw exception instead?
         };
-        my.fun.remove = function(key, force) {
+        my.fun.remove = function (key, force) {
             // TODO: don't delete from master_dict, as safe_remove may fail.
             // we'll worry about this later...
             var transformation1 = my.base.create_transaction('m', 'remove', {
@@ -568,9 +621,9 @@ var mkTelepathy = function(websocket_url) {
                 }
             );
             // execute the delete on the element we just removed.
-            telepathy_shared.execute(transformation2);
+            TS.execute(transformation2);
         };
-        my.fun.keys = function() {
+        my.fun.keys = function () {
             var keys = [];
             var st = my.base.get_current_state();
             var k;
@@ -579,16 +632,16 @@ var mkTelepathy = function(websocket_url) {
             }
             return keys;
         };
-        my.base.cb.set_internal_cb("delete", function() {
+        my.base.cb.set_internal_cb("delete", function () {
             // delete all children as well
             var keys = my.fun.keys();
             for (var k = 0; k < keys.length; k++) {
                 var child_oid = my.base.cb.get_current_state()[k];
-                telepathy_shared.master_dict[child_oid].set_parent(null);
-                telepathy_shared.master_dict[child_oid].cb.fire_async("delete");
+                TS.master_dict[child_oid].set_parent(null);
+                TS.master_dict[child_oid].cb.fire_async("delete");
             }
         });
-       my.fun.remote_transformation = function(message) {
+       my.fun.remote_transformation = function (message) {
        // dict-s can receive two transformations:
        // set - due to another client's set, or the ack/nack this client's (safe)set
        // remove - remove an element from the dictionary
@@ -610,7 +663,7 @@ var mkTelepathy = function(websocket_url) {
                     }
                     break;
                 default:
-                    throw_ex( "bad remote transformation on dict",
+                    TS.util.throw_ex( "bad remote transformation on dict",
                         {transformation: message}
                     );
             };
@@ -621,12 +674,12 @@ var mkTelepathy = function(websocket_url) {
            cb: my.base.cb,
            exports: {
                 get: my.fun.get,
-                set: function(key,val) {my.fun.set(key,val,true);},
-                safe_set: function(key,val) {my.fun.set(key,val,false);},
-                remove: function(key,val) {my.fun.remove(key,true);},
-                safe_remove: function(key,val) {my.fun.remove(key,false);},
+                set: function (key,val) {my.fun.set(key,val,true);},
+                safe_set: function (key,val) {my.fun.set(key,val,false);},
+                remove: function (key,val) {my.fun.remove(key,true);},
+                safe_remove: function (key,val) {my.fun.remove(key,false);},
                 keys: my.fun.keys, 
-                size: function() {return my.base.get_current_state().length;}
+                size: function () {return my.base.get_current_state().length;}
            }
        };
        // register newly created object
@@ -638,13 +691,13 @@ var mkTelepathy = function(websocket_url) {
     //  -------------------------
     //  - MAIN TELEPATHY MODULE -
     //  -------------------------
-    var mkMain = function() {
+    TS.modules.mkMain = function () {
 
         // MODULE FIELDS
         var my = {
             // websocket object
             connection: null, 
-            cb: mkCallbackManager({name:"main telepathy object"}),
+            cb: TS.modules.mkCallbackManager({name:"main telepathy object"}),
             state_list: {
                 INACTIVE: 0,
                 AUTH: 1,
@@ -654,7 +707,7 @@ var mkTelepathy = function(websocket_url) {
         };
         my.cb.debug(true); // for DEVEL: debug main CB manager.
 
-        my.create_object = function(msg) {
+        my.create_object = function (msg) {
             var new_obj = null;
             switch (msg.type) {
             case "data":
@@ -667,43 +720,39 @@ var mkTelepathy = function(websocket_url) {
                 break;
                 new_obj = mkList({oid: msg.oid});
             default:
-                throw_ex ("Unknown data type: " + msg.type);
+                TS.util.throw_ex ("Unknown data type: " + msg.type);
             };
             return new_obj;
         };
 
-        my.transform_object = function(msg) {
-            if (!(msg.oid in telepathy_shared.master_dict)) throw_ex("Unknown object id: " + msg.oid);
-            return telepathy_shared.master_dict[msg.oid].cb.fire("server_message", msg);
+        my.transform_object = function (msg) {
+            if (!(msg.oid in TS.master_dict)) TS.util.throw_ex("Unknown object id: " + msg.oid);
+            return TS.master_dict[msg.oid].cb.fire("server_message", msg);
         };
 
-        my.websocket_safe_send = function(data) {
+        my.websocket_safe_send = function (data) {
             retry_until(
                 // condition
-                function() {
-                    return telepathy_shared.connection.readyState == 1;
-                },
+                function () { return TS.connection.readyState == 1;},
                 // on success
-                function() {
-                    telepathy_shared.connection.send(data);
-                }
+                function () {TS.connection.send(data);}
             );
         };
 
         // Callback functions
         my.handle_incoming_message = [];
-        my.handle_incoming_message[my.state_list.AUTH] = function(msg_obj) {
+        my.handle_incoming_message[my.state_list.AUTH] = function (msg_obj) {
             // TODO: respond to authentication challenge
             // Right now, there's no authentication, we assume it succeeded:
             if ("client_id" in msg_obj) {
-                telepathy_shared.config.client_id = msg_obj.client_id;
-                telepathy_shared.counters.object_id.set_prefix(msg_obj.client_id + ".");
+                TS.config.client_id = msg_obj.client_id;
+                TS.counters.object_id.set_prefix(msg_obj.client_id + ".");
                 my.state = my.state_list.CONNECTED;
                 my.cb.fire("connection_state_change", [my.state]);
             }
             else console.error("expected client id, received " + JSON.stringify(msg_obj));
         };
-        my.handle_incoming_message[my.state_list.CONNECTED] = function(msg_obj) {
+        my.handle_incoming_message[my.state_list.CONNECTED] = function (msg_obj) {
             // should we create an object?
             for (var i = 0; i < msg_obj.length; i++) {
                 var msg = msg_obj[i];
@@ -715,25 +764,25 @@ var mkTelepathy = function(websocket_url) {
                     my.transform_object(msg);
                     continue;
                 }
-                throw_ex ("Unknown message type received");
+                TS.util.throw_ex ("Unknown message type received");
             }
         };
 
         // handle incoming message from server
-        my.cb.set_internal_cb("ws_onopen", function() {
-            retry_until(
+        my.cb.set_internal_cb("ws_onopen", function () {
+            TS.util.retry_until(
                 // condition
-                function() {
-                    return telepathy_shared.connection.readyState == 1;
+                function () {
+                    return TS.connection.readyState == 1;
                 },
                 // on success
-                function() {
-                    telepathy_shared.connection.send("client-connected");
+                function () {
+                    TS.connection.send("client-connected");
                     my.state = my.state_list.AUTH;
                 }
             );
         });
-        my.cb.set_internal_cb("ws_onmessage", function(msg) {
+        my.cb.set_internal_cb("ws_onmessage", function (msg) {
             console.log(msg.timeStamp + " - received: '" + msg.data + "'");
             var t = null;
             try {
@@ -747,40 +796,34 @@ var mkTelepathy = function(websocket_url) {
             }
             else console.log("failed to parse incoming message '" + msg+"'");
         });
-        my.cb.set_internal_cb("ws_onclose", function() {
+        my.cb.set_internal_cb("ws_onclose", function () {
             // TODO: attempt to re-open the connection
-            console.log("ws_onclose fired, arguments: " + args2array(arguments));
+            console.log("ws_onclose fired, arguments: " + TS.util.args2array(arguments));
         });
-        my.cb.set_internal_cb("ws_error", function() {
+        my.cb.set_internal_cb("ws_error", function () {
             // TODO: attempt to handle the error
-            console.log("ws_error fired, arguments: " + args2array(arguments));
+            console.log("ws_error fired, arguments: " + TS.util.args2array(arguments));
         });
 
         // CREATE root element and meta-object
-        my.root = mkDict({oid: '0.0', local_only: true});
-        telepathy_shared.master_dict.meta_object = mkMetaObject({cb: my.cb});
+        // my.root is created in a remote transaction so the server doesn't receive
+        // the transaction.
+        var mk_root_t = TS.modules.mkTransaction({is_remote: true});
+        TS.master_dict.meta_object = TS.modules.mkMetaObject({cb: my.cb, transaction: mk_root_t});
+        my.root = TS.modules.mkDict({oid: '0.0', transaction: mk_root_t});
+        mk_root_t.apply();
 
-        telepathy_shared.create_message = function(message_type) {
-            return {
-                header: {
-                    id: telepathy_shared.counters.client_message_id.getint(),
-                    last_server_message_id: telepathy_shared.counters.last_server_message_id,
-                    message_type: message_type,
-                    ts: {
-                        created:  get_timestamp()
-                    }
-                }
+        TS.outqueue.add_transaction = function (t) {
+            t.header.ts.queued = TS.util.get_timestamp();
+            t.response = {
+                ack: TS.util.prepare_acks_of_remote_transactions()
             };
+            TS.outqueue.push(t);
         };
-        telepathy_shared.outqueue = [];
-        telepathy_shared.outqueue.add = function(t) {
-            t.header.ts.queued = get_timestamp();
-            telepathy_shared.outqueue.push(t);
-        };
-        telepathy_shared.outqueue.flush = function() {
-            while (telepathy_shared.outqueue.length > 0) {
-                var t = telepathy_shared.outqueue.shift();
-                t.header.ts.sent = get_timestamp();
+        TS.outqueue.flush = function () {
+            while (TS.outqueue.length > 0) {
+                var t = TS.outqueue.shift();
+                t.header.ts.sent = TS.util.get_timestamp();
                 my.websocket_safe_send(JSON.stringify(t));
             }
         };
@@ -789,19 +832,20 @@ var mkTelepathy = function(websocket_url) {
         // master dictionary manipulation (for internal use only):
         var exports = {
             // ---- exports methods ----
-           connect: function() {
-                telepathy_shared.connection=new WebSocket("ws://" + telepathy_shared.config.ws_url);
+           connect: function () {
+                TS.connection=new WebSocket("ws://" + TS.config.ws_url);
                 // Set callbacks for websocket events.
-                telepathy_shared.connection.onopen=my.cb.wrap_signal("ws_onopen");
-                telepathy_shared.connection.onmessage=my.cb.wrap_signal("ws_onmessage");
-                telepathy_shared.connection.onclose=my.cb.wrap_signal("ws_onclose");
-                telepathy_shared.connection.onerror=my.cb.wrap_signal("ws_onerror");
+                TS.connection.onopen=my.cb.wrap_signal("ws_onopen");
+                TS.connection.onmessage=my.cb.wrap_signal("ws_onmessage");
+                TS.connection.onclose=my.cb.wrap_signal("ws_onclose");
+                TS.connection.onerror=my.cb.wrap_signal("ws_onerror");
                 },
-           disconnect: function() {},
+           disconnect: function () {},
            root: my.root.exports,
            set_cb: my.cb.set_user_cb,
-           make_data: function(initial_value) {return (mkData({state: initial_value})).exports;},
-           make_dict: function() {return (mkDict()).exports;}
+           make_data: function (spec) {return (TS.modules.mkData(spec || {})).exports;},
+           make_dict: function (spec) {return (TS.modules.mkDict(spec || {})).exports;},
+           make_transaction: function () {return TS.modules.mkTransaction().exports;}
            // make_list
         };
         // RETURN EXPORTS
@@ -812,9 +856,9 @@ var mkTelepathy = function(websocket_url) {
     // Now that we have defined all the modules we need,
     // we create a telepathy instance with mkMain, then
     // return a list of exports
-    telepathy_shared.counters.object_id = mkCounter();
-    telepathy_shared.counters.client_message_id = mkCounter();
-    telepathy_shared.counters.last_server_msg_id = 0;
-    var main = mkMain();
+    TS.counters.object_id = TS.modules.mkCounter();
+    TS.counters.client_message_id = TS.modules.mkCounter();
+    TS.counters.last_server_msg_id = 0;
+    var main = TS.modules.mkMain();
     return main;
 }; // END mkTelepathy

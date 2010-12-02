@@ -1,0 +1,12 @@
+telepathy = mkTelepathy("localhost:8080/ws_test_backend.yaws");
+telepathy.set_cb('connection_state_change', function(newstate) {
+    console.log("new telepathy connection state is " + newstate);
+    try {
+        var v = telepathy.make_data({value: 1});
+        v.set(2);
+    } catch (e) {
+        console.log(e.stack);
+    }
+});
+telepathy.connect();
+

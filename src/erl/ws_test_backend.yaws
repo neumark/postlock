@@ -30,13 +30,24 @@ websocket_owner() ->
 	_ -> ok
     end.
 
+process_incoming(Msg) ->
+	    io:format("Got data from Websocket: ~p~n", [Msg]),
+        json:encode(Msg).
+
 echo_server(WebSocket) ->
     receive
 	{tcp, WebSocket, DataFrame} ->
-	    Data = yaws_api:websocket_unframe_data(DataFrame),
-	    io:format("Got data from Websocket: ~p~n", [json:decode_string(erlang:binary_to_list(Data))]),
-            yaws_api:websocket_send(WebSocket, Data), 
-            echo_server(WebSocket);
+        Lin = lists:map(fun(X) -> erlang:element(2,json:decode_string(erlang:binary_to_list(X))) end, yaws_websockets:unframe_all(DataFrame, [])),
+	    io:format("Lin is: ~p~n", [Lin]),
+        %Lout = lists:map(
+        %    fun(Bin) ->
+        %        Response = process_incoming(json:decode_string(erlang:binary_to_list(Bin))),
+        %        io:format("sending: ~p~n", [Response])
+        %    end,
+        %Lin),
+	    %io:format("Lout is: ~p~n", [Lout]),
+        yaws_api:websocket_send(WebSocket, "ok"),
+        echo_server(WebSocket);
 	{tcp_closed, WebSocket} ->
 	    io:format("Websocket closed. Terminating echo_server...~n");
     {send, ToBeSent} ->

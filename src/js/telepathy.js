@@ -49,12 +49,16 @@ var mkTelepathy = function (websocket_url) {
         // - Utility functions -
         // ---------------------
         util: {
-            sanitize_spec: function (spec) {
-                var i, illegal_props = {'type':1, 'oid':1, 'is_remote':1};
-                for (i in spec) {
-                    if (i in illegal_props && spec.hasOwnProperty[i]) delete spec[i];
+            require_transaction: function (fun, t, t_spec) {
+                // there may be a transaction in the arguments
+                var apply_t = false;
+                if (!TS.util.is_transaction(t)) {
+                    apply_t = true;
+                    t = TS.modules.mkTransaction(t_spec);
                 }
-                return spec;
+                fun(t);
+                if (apply_t) t.apply();
+                return t;
             },
             // from: http://www.javascriptkit.com/javatutors/arraysort.shtml
             numeric_sort: function (a, b) {
@@ -95,7 +99,7 @@ var mkTelepathy = function (websocket_url) {
                 throw e;
             },
             is_transaction: function (t) {
-                return typeof t === "object " && t.get_tid && typeof t.get_tid === "function";
+                return typeof t === "object" && typeof t.get_tid === "function";
             },
             // from: http://stackoverflow.com/questions/122102/what-is-the-most-efficient-way-to-clone-a-javascript-object
             clone: function (from) {
@@ -215,7 +219,7 @@ var mkTelepathy = function (websocket_url) {
                 if (my.debug) {
                     console.log("Callback manager for " + my.id + " received signal " + signal + " with arguments " + args + ".");
                 }
-                return true;
+                return {fire_user_cb: true};
             },
             fire: function (signal, args) {
                 // apply the internal callback first
@@ -226,9 +230,13 @@ var mkTelepathy = function (websocket_url) {
                 else {
                     first_cb = function(a) {return my.default_callback(signal, a);};
                 }
-                result.internal_result = first_cb.apply(this, args_array);
+                result.internal_result = first_cb.apply(this, args_array) || {fire_user_cb: true};
                 // apply the user-defined cb if one exists
-                if (signal in my.user_cb) result.user_result = my.user_cb[signal].apply(this,args_array);
+                if (result.internal_result.fire_user_cb && 
+                    (signal in my.user_cb)) {
+                    if (result.internal_result.user_cb_data) args_array.push(result.internal_result.user_cb_data);
+                    result.user_result = my.user_cb[signal].apply(this,args_array);
+                }
                 return result;
             }
         }; // END my    
@@ -260,7 +268,7 @@ var mkTelepathy = function (websocket_url) {
         var my = {
             msg: TS.util.create_message('t'), // a message of type t = transaction 
             // transaction status-es:
-            // init - transaction is under composition
+            // init - transaction is under composition (initial state)
             // applying
             // applied - the transaction has been locally applied, ACK from server pending
             // acknowledged - the transaction has been acknowledged
@@ -294,7 +302,7 @@ var mkTelepathy = function (websocket_url) {
             var i;
             for (i in t_map) {
                 if (!t_map.hasOwnProperty(i)) continue;
-                TS.objects.get(i).rollback_transaction(my.get_tid());
+                TS.objects.get(i).cb.fire('rollback_transaction',[my.get_tid()]);
             }
             my.current_status = "aborted";
             // unregister transaction
@@ -302,13 +310,12 @@ var mkTelepathy = function (websocket_url) {
         };
 
         my.apply_locally = function () {
-            var i, successfully_applied, t_map = my.make_t_map();
+            var i, t_map = my.make_t_map();
             try {
                 for (i in t_map) {
                     if (!t_map.hasOwnProperty(i)) continue;
-                    successfully_applied = (TS.objects.get(i).cb.fire("apply_transaction", 
-                        [my.get_tid(), t_map[i]])).internal_result === true;
-                    if (!successfully_applied) TS.util.throw_ex("application of transaction failed", t_map[i]);
+                    // 'apply_transaction' handler will throw ex if transaction cannot be applied.
+                    TS.objects.get(i).cb.fire("apply_transaction", [my.get_tid(), t_map[i]]);
                 }
                 my.current_status = "applied";
                 return true;
@@ -334,7 +341,7 @@ var mkTelepathy = function (websocket_url) {
             var t_map = my.make_t_map();
             for (i in t_map) {
                 if (!t_map.hasOwnProperty(i)) continue;
-                TS.objects.get(i).ack_transaction(my.get_tid());
+                TS.objects.get(i).cb.fire("ack_transaction", [my.get_tid()]);
             }
             // unregister transaction
             delete TS.transactions.local[my.get_tid()];
@@ -408,16 +415,15 @@ var mkTelepathy = function (websocket_url) {
                 my.cb.fire("delete", message);
                 return;
             }
+            // TODO: fire event instead!
             return spec.fun.remote_transformation(message);
         });
         my.cb.set_internal_cb("apply_transaction", function(tid, transformations) {
-            var i;
+            var i, results = [];
             for (i = 0; i < transformations.length; i++) {
-                if (my.cb.fire(transformations[i].command, [transformations[i].parameters]).internal_result !== true) {
-                    return false;
-                }
+                results.push(my.cb.fire(transformations[i].command, [tid, transformations[i].parameters]));
             }
-            return true;
+            return results;
         });
  
         // EXPORTS
@@ -426,56 +432,41 @@ var mkTelepathy = function (websocket_url) {
                 get_type: function () {return spec.type+'';},
                 set_cb: my.cb.set_user_cb,
             };
-        my.require_transaction = function (fun, args, t_spec) {
-            // there may be a transaction in the arguments
-            var t = args[args.length-1];
-            var apply_t = false;
-            if (!TS.util.is_transaction(t)) {
-                apply_t = true;
-                t = TS.modules.mkTransaction(t_spec);
-            }
-            fun(t, args);
-            if (apply_t) t.apply();
-            return t;
-        };
         return {
             cb: my.cb,
             exports: my.exports,
-            finish_object: function (desc, parameters) {
+            finish_object: function (desc, parameters, transaction) {
                 desc.exports = desc.exports || {};
                 TS.util.copy_methods(my.exports, desc.exports);
                 // add object to objects
                 TS.objects[desc.exports.get_oid()] = desc;
                 // if no transaction was specified or transaction is local,
                 // add 'create' transformation.
-                if (!spec.transaction || !spec.transaction.is_remote()) {
-                    my.require_transaction(
-                        function (t) {
-                            parameters = parameters || {};
-                            parameters.type = spec.type;
-                            parameters.oid = my.oid;
-                            t.add_transformation(
-                                TS.objects.get("meta_object").create_transformation(
-                                    'create', parameters));},
-                        [spec.transaction]);
+                if (!transaction.is_remote()) {
+                    parameters = parameters || {};
+                    parameters.type = spec.type;
+                    parameters.oid = my.oid;
+                    transaction.add_transformation(
+                        TS.objects.get("meta_object").create_transformation(
+                            'create', parameters));
                 }
                 return desc;
             },
-            require_transaction: my.require_transaction,
-            create_transformation: function (command, parameters) {
+            create_transformation: function (command, parameters, transaction) {
                 parameters = parameters || {};
                 parameters.oid = my.oid;
-                return {
-                    command: command,
-                    parameters: parameters
-                };
-            }
+                return TS.util.require_transaction(
+                    function (t) {
+                        t.add_transformation({
+                            command: command,
+                            parameters: parameters});},
+                            transaction);}
         };
     };
 
     // Metaobject is the telepathy object that gets invoked if
     // no object id is given for a transaction (eg: object creation).
-    TS.modules.mkMetaObject = function (spec) {
+    TS.modules.mkMetaObject = function (spec, transaction) {
         var my = {
             unacked_objects: {},
             pending_transactions: {},
@@ -518,157 +509,207 @@ var mkTelepathy = function (websocket_url) {
             exports: {},
             transactions: {}
         };
-        return my.base.finish_object(ret);
+        TS.util.require_transaction(
+            function (t) {
+                my.base.finish_object(ret, {}, t)},
+            transaction);
+        return ret;
    };
  
     // Data module for telepathy data nodes.
-    TS.modules.mkData = function (spec) {
+    TS.modules.mkData = function (spec, transaction) {
         // MODULE FIELDS:
-        var fun = {};
+        spec = spec || {};
+        spec.type = 'data';
         var my = {
+            pending_set_tid: null, // pending transaction
             value: spec.value,
             // fun is used by the base class's callback for 'server_message'
             fun: {},
-            base: TS.modules.mkTelepathyObject({
-                oid: spec.oid, 
-                type: 'data',
-                fun: fun
-            }),
-            fun: fun
+            base: TS.modules.mkTelepathyObject(spec),
         };
 
-        my.fun.set = function (val, overwrite) {
-            return my.base.require_transaction(
-                function (t) {
-                    t.add_transformation(
-                        my.base.create_transformation(
-                            'set',
-                            {value: val, overwrite: overwrite}))},
-                arguments);
+        my.fun.do_set = function (val, force, transaction) {
+            var t = my.base.create_transformation(
+                'set', {value: val, force: force},
+                transaction);
+            my.pending_set_tid = t;
+            return t;
         };
 
-        my.base.cb.set_internal_cb('set', function(parameters) {
-            my.value = parameters.value;
-            return true;
+        my.base.cb.set_internal_cb('ack_transaction', function(tid) {
+            if (my.pending_set_tid === tid) {
+                my.pending_set_tid = null;
+            } // If condition is false, then an overridden transaction has been ack'd.
+        });
+
+        my.base.cb.set_internal_cb('set', function(tid, parameters) {
+            var user_cb_data = {old_value: my.value, new_value: parameters.value};
+            if (TS.transactions.get(tid).exports.is_remote()) {
+                // remote case - do nothing if there are pending local set(s).
+                if (my.pending_set_tid === null) {
+                    my.value = parameters.value;
+                    return {fire_user_cb: true, user_cb_data: user_cb_data};
+                }
+            } else {
+                // local case - apply set & register pending transaction.
+                my.value = parameters.value;
+                my.pending_set_tid = tid;
+                return {fire_user_cb: true, user_cb_data: user_cb_data};
+            }
+            // Do nothing
+            return {fire_user_cb: false};
         });
        
         var ret = {
             cb: my.base.cb,
             exports: {
-                set: function (val) {my.fun.set(val,true);},
-                safe_set: function (val) {my.fun.set(val,false);},
+                set: function (val, t) {my.fun.do_set(val,true, t);},
+                safe_set: function (val, t) {my.fun.do_set(val,false, t);},
                 get: function () {return TS.util.clone(my.value);},
             },
         };
-        return my.base.finish_object(ret, {value: my.value});
+
+        TS.util.require_transaction(
+            function (t) {
+                my.base.finish_object(ret, {value: my.value},t)},
+            transaction);
+        return ret;
    };
 
     // Dict module for telepathy dict nodes.
-    TS.modules.mkDict = function (spec) {
+    TS.modules.mkDict = function (spec, transaction) {
         // MODULE FIELDS:
+        spec = spec || {};
+        spec.type = 'dict';
         var my = {
+            base: TS.modules.mkTelepathyObject(spec),
             fun: {
                 to_internal_key: function (v) {return "entry_" + v;},
                 from_internal_key: function (v) {return v.slice(6);},
             },
-            pending_transactions: {}
-        }
-        my.base = TS.modules.mkTelepathyObject({
-            oid: spec.oid, 
-            type: 'dict',
-            fun: my.fun,
-            transaction: spec.transaction
-        });
-        my.fun.do_set = function (key, child_oid) {
-            // set newly acquired child's parent
-            // check if val's parent is null.
-            // if not, throw excpetion.
-            if (TS.objects[child_oid].exports.get_parent() !== null) {
-                my.fun.existing_parent_ex(child_oid);
-            }
-            TS.objects[child_oid].set_parent(my.base.exports.get_oid());
-            var newstate = clone(my.base.get_current_state());
-            newstate[my.fun.to_internal_key(key)] = child_oid;
-            return newstate;
+            // acknowledged key, value entries live in data
+            // format: key -> value
+            data: {},
+            // unacked remove's are stored in locally_removed
+            // local sets after local removes result in the entry
+            // for oid being removed.
+            // format: key -> pending remove transaction's tid
+            pending_remove: {},
+            // pending updates contain sets on keys which exist
+            // on the server, but where the set command has not
+            // been acknoledged yet
+            // format: key -> {tid, last pending set transform on key's parameters}
+            pending_update: {},
+            // pending_new_entries are sets on new keys which
+            // have not yet been acknowledged
+            // format: key -> {tid, last pending set transformation on key's parameters}
+            pending_new: {}
         };
-        my.fun.do_remove = function (key) {
-            var internal_key = my.fun.to_internal_key(key);
-            // update parent of newly removed item:
-            TS.objects[my.base.get_current_state()[internal_key]].set_parent(null);
-            var newstate = clone(my.base.get_current_state());
-            if (internal_key in newstate) {
-                delete newstate[internal_key];
-            }
-            return newstate;
-        };
-        my.fun.set = function (key, val, overwrite) {
-            var newstate = my.fun.do_set(key, val.get_oid()); 
-            // create 'set' transformation
-            var transformation = my.base.create_transaction('m', 'set', {
-                key: key,
-                child_oid: val.get_oid(),
-                overwrite: overwrite
-            }); 
-            my.base.update_current_state(newstate, transformation);
-        };
-        my.fun.get = function (key) {
-            var k = my.fun.to_internal_key(key);
-            var st = my.base.get_current_state();
-            if ((k in st) &&
-                (st[k] in TS.objects)) {
-                return TS.objects[st[k]].exports;
-            } else return undefined; // throw exception instead?
-        };
-        my.fun.remove = function (key, force) {
-            // TODO: don't delete from objects, as safe_remove may fail.
-            // we'll worry about this later...
-            var transformation1 = my.base.create_transaction('m', 'remove', {
-                    key: key,
-                    force: force 
-                }
-            );
-            var newstate = my.fun.do_remove(key);
-            my.base.update_current_state(newstate, transformation1);
-            var transformation2 = my.base.create_transaction('e', 'delete', {
-                    key: key,
-                }
-            );
-            // execute the delete on the element we just removed.
-            TS.execute(transformation2);
-        };
+        my.fun.do_set = function (key, child_oid, force, transaction) {
+            return my.base.create_transformation(
+                'set', {
+                        key: key,
+                        value: child_oid,
+                        force: force});};
+        my.fun.do_remove = function (key, force, transaction) {
+            return my.base.create_transformation(
+                'remove', {
+                        key: key,
+                        force: force});};
         my.fun.keys = function () {
-            var keys = [];
-            var st = my.base.get_current_state();
-            var k;
-            for (k in st) {
-                if (st.hasOwnProperty(k)) keys.push(my.fun.from_internal_key(k));
-            }
-            return keys;
+            var i, keys = {}, key_list = [];
+            // add any ack'd data
+            for (i in my.data) if (my.data.hasOwnProperty(i)) keys[i] = true;
+            // add locally pending new keys
+            for (i in my.pending_new) if (my.pending_new.hasOwnProperty(i)) keys[i] = true;
+            // remove pending removes
+            for (i in my.pending_remove) if (my.pending_remove.hasOwnProperty(i)) delete keys[i];
+            // add all keys to list
+            for (i in my.keys) if (my.keys.hasOwnProperty(i)) key_list.push(my.fun.from_internal_key(i));
+            key_list.sort();
+            return key_list;
         };
-        my.base.cb.set_internal_cb("delete", function () {
-            // delete all children as well
-            var keys = my.fun.keys();
-            for (var k = 0; k < keys.length; k++) {
-                var child_oid = my.base.cb.get_current_state()[k];
-                TS.objects[child_oid].set_parent(null);
-                TS.objects[child_oid].cb.fire_async("delete");
+
+        my.fun.bad_key = function(key) {return undefined};
+
+        my.fun.has_pending_set = function(int_key) {return (int_key in my.pending_update) || (int_key in my.pending_new);};
+
+        my.fun.get = function(key) {
+            var int_key = my.fun.to_internal_key(key);
+            if (int_key in my.pending_remove) return my.fun.bad_key(key);
+            if (int_key in my.pending_new) return TS.objects.get(my.pending_new[int_key].parameters.value);
+            if (int_key in my.pending_update) return TS.objects.get(my.pending_update[int_key].parameters.value);
+            if (int_key in my.data) return TS.objects.get(my.data[int_key]);
+            return my.fun.bad_key(key);
+        };
+
+        my.fun.has_key = function(key) {
+            var int_key = my.fun.to_internal_key(key);
+            return !(int_key in my.pending_remove) &&
+                ((int_key in my.data || int_key in my.pending_new));};
+
+        my.base.cb.set_internal_cb("remove", function (tid, parameters) {
+            var int_key = my.fun.to_internal_key(parameters.key), fire_user_cb = true;
+            if (TS.transactions.get(tid).is_remote()) {
+                // remote case - delete from my.data if there is no pending set on key
+                if (!my.fun.has_pending_set(int_key)) delete my.data[int_key];
+                // only execute user_cb if there is no pending local delete for key
+                fire_user_cb = !(int_key in my.pending_remove);
+            } else {
+                // local case
+                my.pending_remove[int_key] = tid;
             }
+            return {fire_user_cb: fire_user_cb};
         });
-            
+
+        my.base.cb.set_internal_cb("set", function (tid, parameters) {
+            var int_key = my.fun.to_internal_key(parameters.key), user_cb_data, fire_user_cb = true;
+            if (my.fun.has_key(parameters.key)) user_cb_data.old_value = my.fun.get(parameters.key);
+            user_cb_data.new_value = parameters.value;
+
+            if (TS.transactions.get(tid).is_remote()) {
+                // remote case
+                my.data[int_key] = parameters.value;
+                // fire user cb if no pending local sets exist for key
+                fire_user_cb = !my.fun.has_pending_set(int_key);
+            } else {
+                // local case
+                if (my.fun.has_key(parameters.key)) {
+                    // pending update
+                    my.pending_update[int_key] = {tid: tid, parameters: parameters};
+                } else {
+                    // pending new
+                    my.pending_new[int_key] = {tid: tid, parameters: parameters};
+                }
+            }
+            return {fire_user_cb: fire_user_cb, user_cb_data: user_cb_data};
+        });
+
+        my.base.cb.set_internal_cb('ack_transaction', function(tid) {
+            // TODO
+            });
+
+
        var ret = {
            cb: my.base.cb,
            exports: {
                 get: my.fun.get,
-                set: function (key,val) {my.fun.set(key,val,true);},
-                safe_set: function (key,val) {my.fun.set(key,val,false);},
-                remove: function (key,val) {my.fun.remove(key,true);},
-                safe_remove: function (key,val) {my.fun.remove(key,false);},
+                set: function (key,val,t) {my.fun.do_set(key,val,true,t);},
+                safe_set: function (key,val,t) {my.fun.do_set(key,val,false,t);},
+                remove: function (key,val,t) {my.fun.do_remove(key,true,t);},
+                safe_remove: function (key,val,t) {my.fun.do_remove(key,false,t);},
                 keys: my.fun.keys, 
-                size: function () {return my.base.get_current_state().length;}
+                size: function () {return my.fun.keys().length;},
+                has_key: my.fun.has_key           
            }
        };
        // register newly created object
-       return my.base.finish_object(ret);
+       TS.util.require_transaction(
+            function (t) {
+                my.base.finish_object(ret, {}, t)},
+            transaction);
+       return ret;
    };
 
 
@@ -780,8 +821,8 @@ var mkTelepathy = function (websocket_url) {
         // my.root is created in a remote transaction so the server doesn't receive
         // the transaction.
         var mk_root_t = TS.modules.mkTransaction({is_remote: true});
-        TS.modules.mkMetaObject({cb: my.cb, transaction: mk_root_t});
-        my.root = TS.modules.mkDict({oid: '0.0', transaction: mk_root_t});
+        TS.modules.mkMetaObject({cb: my.cb}, mk_root_t);
+        my.root = TS.modules.mkDict({oid: '0.0'}, mk_root_t);
         mk_root_t.apply();
         // meta-object and root's don't need to be acknowledged, so we delete these
         // transactions:
@@ -819,8 +860,8 @@ var mkTelepathy = function (websocket_url) {
            disconnect: function () {},
            root: my.root.exports,
            set_cb: my.cb.set_user_cb,
-           make_data: function (spec) {return (TS.modules.mkData(TS.util.sanitize_spec(spec || {}))).exports;},
-           make_dict: function (spec) {return (TS.modules.mkDict(TS.util.sanitize_spec(spec || {}))).exports;},
+           make_data: function (initial_value, transaction) {return (TS.modules.mkData({value: initial_value}, transaction)).exports;},
+           make_dict: function (transaction) {return TS.modules.mkDict({}, transaction).exports;},
            make_transaction: function () {return TS.modules.mkTransaction().exports;}
            // make_list
         };

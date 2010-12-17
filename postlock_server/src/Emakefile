@@ -1,0 +1,4 @@
+{'*',[debug_info,
+	{i,"../include"},
+	{i, "C:/Users/epteneu/Documents/opt/yaws/include"},
+	{outdir, "../ebin"}]}.

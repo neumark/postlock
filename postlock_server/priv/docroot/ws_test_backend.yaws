@@ -1,0 +1,82 @@
+<erl>
+out(A) -> 
+    P = yaws_api:parse_query(A),
+    case {get_upgrade_header(A#arg.headers), lists:keyfind(clientid, 1, P), lists:keyfind(sessionid, 1, P)} of 
+	{undefined, _, _} ->
+	    {content, "text/plain", "You're not a web sockets client! Go away!"};
+	{"WebSocket", ClientId, {sessionid, SessionId}} ->
+	    WebSocketOwner = spawn(fun() -> websocket_owner(ClientId, SessionId) end),
+	    {websocket, WebSocketOwner, passive};
+    _Any ->
+         {content, "text/plain", "Be sure to set the sessionid (and optionally the clientid) parameters!"}
+    end.
+
+websocket_owner(ClientId, SessionId) ->
+    receive
+	{ok, WebSocket} ->
+	    %% This is how we read messages (plural!!) from websockets on passive mode
+	    case yaws_api:websocket_receive(WebSocket) of
+		{error,closed} ->
+		    io:format("The websocket got disconnected right from the start. "
+			      "This wasn't supposed to happen!!~n");
+		{ok, Messages} ->
+		    case Messages of
+			[<<"client-connected">>] ->
+			    yaws_api:websocket_setopts(WebSocket, [{active, true}]),
+                yaws_api:websocket_send(WebSocket, "{\"client_id\":\"" ++ erlang:integer_to_list(ClientId) ++ "\"}"),
+			    echo_server(WebSocket);
+			Other ->
+			    io:format("websocket_owner got: ~p. Terminating~n", [Other])
+		    end
+	    end;
+	_ -> ok
+    end.
+
+process_incoming(Msg) ->
+	    io:format("Got data from Websocket: ~p~n", [Msg]),
+        json:encode(Msg).
+
+echo_server(WebSocket) ->
+    receive
+	{tcp, WebSocket, DataFrame} ->
+        Lin = lists:map(fun(X) -> erlang:element(2,json:decode_string(erlang:binary_to_list(X))) end, yaws_websockets:unframe_all(DataFrame, [])),
+	    io:format("Lin is: ~p~n", [Lin]),
+        %Lout = lists:map(
+        %    fun(Bin) ->
+        %        Response = process_incoming(json:decode_string(erlang:binary_to_list(Bin))),
+        %        io:format("sending: ~p~n", [Response])
+        %    end,
+        %Lin),
+	    %io:format("Lout is: ~p~n", [Lout]),
+        yaws_api:websocket_send(WebSocket, "ok"),
+        echo_server(WebSocket);
+	{tcp_closed, WebSocket} ->
+	    io:format("Websocket closed. Terminating echo_server...~n");
+    {send, ToBeSent} ->
+        io:format("Sending ~p~n", [ToBeSent]),
+        yaws_api:websocket_send(WebSocket, ToBeSent),
+        echo_server(WebSocket);
+	Any ->
+	    io:format("echo_server received msg:~p~n", [Any]),
+	    echo_server(WebSocket)
+    end.
+
+get_upgrade_header(#headers{other=L}) ->
+    lists:foldl(fun({http_header,_,K0,_,V}, undefined) ->
+                        K = case is_atom(K0) of
+                                true ->
+                                    atom_to_list(K0);
+                                false ->
+                                    K0
+                            end,
+                        case string:to_lower(K) of
+                            "upgrade" ->
+                                V;
+                            _ ->
+                                undefined
+                        end;
+                   (_, Acc) ->
+                        Acc
+                end, undefined, L).
+
+</erl>

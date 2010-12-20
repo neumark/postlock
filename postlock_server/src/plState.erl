@@ -15,7 +15,9 @@
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
-
+% Needed for default table attributes.
+-include("plRegistry.hrl").
+% Needed for mnesia records used by plState.
 -include("plState.hrl").
 
 -record(state, {
@@ -45,7 +47,8 @@ start_link(ServerArgs) ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 init([SessionId, CallbackServer]) ->
-    % TODO: create root node
+    make_session_tables(SessionId), 
+    create_root_node(SessionId),
     {ok, #state{
         sessionid = SessionId,
         callback = CallbackServer
@@ -114,3 +117,28 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
+
+sessionid_to_tablename(SessionId) ->
+    {
+    "objects_" ++ erlang:integer_to_list(SessionId),
+    "transformations_" ++ erlang:integer_to_list(SessionId)
+    }.
+
+make_session_tables(SessionId) ->
+    {ObjTable, TransTable} = sessionid_to_tablename(SessionId),
+	mnesia:create_table(ObjTable, 
+        [{attributes, record_info(fields,postlock_object)}|
+        ?POSTLOCK_DEFAULT_TABLE_ARGS]),
+	mnesia:create_table(TransTable, 
+        [{attributes, record_info(fields,postlock_transformation)}|
+        ?POSTLOCK_DEFAULT_TABLE_ARGS]),
+    error_logger:info_report(["Tables created successfully for session", SessionId]).
+
+create_root_node(SessionId) ->
+    {ObjTable, _} = sessionid_to_tablename(SessionId),
+    Root = #postlock_object{
+        id={SessionId, 0,0},
+        type=dict
+    },
+    mnesia:write(ObjTable, Root, transaction)
+    error_logger:info_report(["Root node created for session", SessionId]).

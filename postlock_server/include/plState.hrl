@@ -14,7 +14,7 @@
 %%% stored.
 %%% ----------------------------------------------------------
 -record(postlock_object, {
-    id,                     % {sessionid, objectid} (key)
+    id,                     % {sessionid, clientid, objectid} (key)
     type,                   % data | dict | list
     contents,               % opaque, content depends upon
                             % the type of object

@@ -47,6 +47,7 @@ start_link(ServerArgs) ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 init([SessionId, CallbackServer]) ->
+    process_flag(trap_exit, true),
     make_session_tables(SessionId), 
     create_root_node(SessionId),
     {ok, #state{
@@ -118,27 +119,28 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%--------------------------------------------------------------------
 
-sessionid_to_tablename(SessionId) ->
+sessionid_to_tablenames(SessionId) ->
     {
-    "objects_" ++ erlang:integer_to_list(SessionId),
-    "transformations_" ++ erlang:integer_to_list(SessionId)
+    erlang:list_to_atom("pl_objects_" ++ erlang:integer_to_list(SessionId)),
+    erlang:list_to_atom("pl_transformations_" ++ erlang:integer_to_list(SessionId))
     }.
 
 make_session_tables(SessionId) ->
-    {ObjTable, TransTable} = sessionid_to_tablename(SessionId),
+    {ObjTable, TransTable} = sessionid_to_tablenames(SessionId),
 	mnesia:create_table(ObjTable, 
-        [{attributes, record_info(fields,postlock_object)}|
-        ?POSTLOCK_DEFAULT_TABLE_ARGS]),
+        [{record_name, postlock_object} | [{attributes, record_info(fields,postlock_object)}|
+        ?POSTLOCK_DEFAULT_TABLE_ARGS]]),
 	mnesia:create_table(TransTable, 
-        [{attributes, record_info(fields,postlock_transformation)}|
-        ?POSTLOCK_DEFAULT_TABLE_ARGS]),
+        [{record_name, postlock_transformation} | [{attributes, record_info(fields,postlock_transformation)}|
+        ?POSTLOCK_DEFAULT_TABLE_ARGS]]),
     error_logger:info_report(["Tables created successfully for session", SessionId]).
 
 create_root_node(SessionId) ->
-    {ObjTable, _} = sessionid_to_tablename(SessionId),
+    {ObjTable, _} = sessionid_to_tablenames(SessionId),
     Root = #postlock_object{
         id={SessionId, 0,0},
         type=dict
     },
-    mnesia:write(ObjTable, Root, transaction)
+    mnesia:transaction(fun() -> mnesia:write(ObjTable, Root, write) end),
     error_logger:info_report(["Root node created for session", SessionId]).
+

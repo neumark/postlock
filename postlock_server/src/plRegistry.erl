@@ -66,7 +66,7 @@ handle_call({new_session, CallbackServer}, _From, State) ->
     {reply, Reply, State};
 
 handle_call(Request, _From, State) ->
-    io:format("Unhandled call sent to postlock_registry:handle_call - ~p~n",[Request]),
+    io:format("Unhandled call sent to plRegistry:handle_call - ~p~n",[Request]),
     Reply = ok,
     {reply, Reply, State}.
 
@@ -77,7 +77,7 @@ handle_call(Request, _From, State) ->
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
 handle_cast(Msg, State) ->
-    io:format("Unhandled call sent to postlock_registry:handle_cast - ~p~n",[Msg]),
+    io:format("Unhandled call sent to plRegistry:handle_cast - ~p~n",[Msg]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -86,9 +86,14 @@ handle_cast(Msg, State) ->
 %%                                       {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
+handle_info({'EXIT', Pid, _Reason}, State) ->
+    %% Todo: handle EXIT messages from sync and state servers!
+    io:format("Sync/State server with PID ~p died! TODO: restart server, update mnesia!~n",[Pid]),
+    {noreply, State};
+
 handle_info(Info, State) ->
     %% Todo: handle EXIT messages from sync and state servers!
-    io:format("Unhandled request sent to postlock_registry:handle_info - ~p~n",[Info]),
+    io:format("Unhandled request sent to plRegistry:handle_info - ~p~n",[Info]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -175,14 +180,13 @@ create_sync_server(SessionId, WebSocketOwner) ->
 %%--------------------------------------------------------------------
 create_state_server(CallbackServer) ->
     SessionId = get_next_session_id(),
+    io:format(" -------------- sessionid ~p~n", [SessionId]),
     % TODO: handle cases where {error, Reason} is returned
     {ok, NewStateServer} = plState:start_link([SessionId, CallbackServer]),
     % save state server PID to mnesia
-    F = fun() ->
-        NewSessionRec = #postlock_session{id = SessionId, state_server = NewStateServer},
-        mnesia:write(NewSessionRec)
-    end,
-    mnesia:transaction(F),
+    NewSessionRec = #postlock_session{id = SessionId, state_server = NewStateServer},
+    io:format("NewSessionRec: ~p~n", [NewSessionRec]),
+    mnesia:transaction(fun() -> mnesia:write(NewSessionRec) end),
     {NewStateServer, SessionId}.
 
 make_tables() ->

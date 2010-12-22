@@ -14,7 +14,7 @@
 %%% stored.
 %%% ----------------------------------------------------------
 -record(postlock_object, {
-    id,                     % {sessionid, clientid, objectid} (key)
+    id,                     % {clientid, objectid} (key)
     type,                   % data | dict | list
     contents,               % opaque, content depends upon
                             % the type of object
@@ -29,7 +29,7 @@
 -record(postlock_transformation, {
     id,                     % integer (key)
     user,                   % id of user who submitted t
-    command,                % command of transformation
+    cmd,                    % command of transformation
     oid,                    % may be undefined for 'create'
     parameters,             % parameters to the command
     extra_data              % optional extra data
@@ -42,7 +42,9 @@
 -record(postlock_transaction, {
     id,                     % integer (key)
     user,                   % id of user who submitted t
-    transformations = []   % list of transformation
+    ack = []                % a list of ACKs sent by the client
+    transformations = []    % list of transformations
+    received = now()        % timestamp of transaction
 }).
 
 %%% ----------------------------------------------------------

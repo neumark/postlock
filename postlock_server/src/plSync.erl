@@ -124,10 +124,15 @@ client_init(_Event, _From, State) ->
 %% Event should be {client_message|state_server_message, Message}.
 %%--------------------------------------------------------------------
 
-connected({client_message, Msg}, State) ->
+connected({client_message, {ok, Msg}}, State) ->
     % Message is the json-decoded term received from the client
     io:format("connected/2 got client message ~p~n",[Msg]),
     {next_state, connected, State};
+connected({client_message, Msg}, State) ->
+    % Message is the json-decoded term received from the client
+    io:format("connected/2 got unparseable client message ~p~n",[Msg]),
+    {next_state, connected, State};
+
 connected({state_server_message, Msg}, State) ->
     io:format("connected/2 got server message ~p~n",[Msg]),
     {next_state, connected, State}.
@@ -236,3 +241,15 @@ process_pending_transformation(_Transformation, State) ->
     % STUB -- do nothing for now.
     State.
    
+%%--------------------------------------------------------------------
+%%% Input message parsing functions
+%%--------------------------------------------------------------------
+json_to_transaction({struct, JsonMessage}) ->
+    try
+        Header = lists:keyfind(header, 1, JsonMessage),
+        Transformations = lists:keyfind(transformations, 1, JsonMessage),
+        Response = lists:keyfind(response, 1, JsonMessage),
+        #postlock_transaction{}
+    catch
+        _:_ -> {error, "failed to parse transaction", JsonMessage}
+    end.

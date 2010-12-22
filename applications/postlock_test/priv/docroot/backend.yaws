@@ -1,0 +1,7 @@
+<erl>
+out(A) ->
+    SessionId = gen_server:call(postlock_test_cb, {get_sessionid}),
+    Ret = plApi:connect_websocket(A#arg.headers, SessionId),
+    error_logger:info_report(["backend.yaws returning",Ret]),
+    Ret.
+</erl>

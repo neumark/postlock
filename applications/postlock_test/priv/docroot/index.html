@@ -1,0 +1,61 @@
+<html>
+<head><title>postlock unit tests</title>
+<link href="https://github.com/jquery/qunit/raw/master/qunit/qunit.css" rel="stylesheet" type="text/css" />
+<script type="text/javascript" src="http://code.jquery.com/jquery-latest.js"></script>
+<script type="text/javascript" src="https://github.com/jquery/qunit/raw/master/qunit/qunit.js"></script>
+<script type="text/javascript" src="http://localhost:8001/postlock.js"></script>
+<script type="text/javascript">
+
+
+// from QUnit docs
+$(document).ready(function(){
+    
+test("a basic test example", function() {
+  ok( true, "this test is fine" );
+  var value = "hello";
+  equals( "hello", value, "We expect value to be hello" );
+});
+
+module("Module A");
+
+test("first test within module", function() {
+  ok( true, "all pass" );
+});
+
+test("second test within module", function() {
+  ok( true, "all pass" );
+});
+
+module("Module B");
+
+test("some other test", function() {
+  expect(2);
+  equals( true, false, "failing test" );
+  equals( true, true, "passing test" );
+});
+
+  });
+
+var postlock = mkPostlock(document.location.href.slice(7) + "backend.yaws");
+postlock.set_cb('connection_state_change', function(newstate) {
+    console.log("new telepathy connection state is " + newstate);
+    try {
+        var v = postlock.make_data({value: 1});
+        v.set(2);
+    } catch (e) {
+        console.log(e.stack);
+    }
+});
+postlock.connect();
+</script>
+</head>
+<body>
+<h1>Postlock unit tests</h1>
+<h1 id="qunit-header">QUnit example</h1>
+<h2 id="qunit-banner"></h2>
+<div id="qunit-testrunner-toolbar"></div>
+<h2 id="qunit-userAgent"></h2>
+<ol id="qunit-tests"></ol>
+<div id="qunit-fixture">test markup, will be hidden</div>
+</body>
+</html>

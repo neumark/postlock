@@ -42,7 +42,8 @@ start_link() ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 init([]) ->
-    {ok, #state{sessionid=plApi:create_session(?SERVER)}}.
+    {_, SessionId} = gen_server:call(plRegistry,{new_session, ?SERVER}),
+    {ok, #state{sessionid=SessionId}}.
 
 %%--------------------------------------------------------------------
 %% Function: handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -53,7 +54,7 @@ init([]) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call(get_sessionid, _From, State) ->
+handle_call({get_sessionid}, _From, State) ->
     {reply, State#state.sessionid, State};
 
 handle_call(Request, _From, State) ->

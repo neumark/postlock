@@ -28,7 +28,7 @@
 %%% ----------------------------------------------------------
 -record(postlock_transformation, {
     id,                     % integer (key)
-    user,                   % id of user who submitted t
+    client,                 % id of user who submitted t
     cmd,                    % command of transformation
     oid,                    % may be undefined for 'create'
     parameters,             % parameters to the command
@@ -41,9 +41,11 @@
 %%% ----------------------------------------------------------
 -record(postlock_transaction, {
     id,                     % integer (key)
-    user,                   % id of user who submitted t
-    ack = []                % a list of ACKs sent by the client
-    transformations = []    % list of transformations
+    client,                 % id of user who submitted t
+    ack = [],               % a list of ACKs sent by the client
+                            % or server
+    nack = [],              % a list of NACKs sent by the server
+    transformations = [],   % list of transformations
     received = now()        % timestamp of transaction
 }).
 

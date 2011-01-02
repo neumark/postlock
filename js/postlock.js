@@ -1,12 +1,17 @@
 /*
   postlock.js - javascript client API for postlock.
   author: neumark
+  todo:
+  - update transformation callback handlers to take (tid, is_remote, transaction) instead of old format
+  - after inital copy update exported reference to root node.
+  - update mkMain make_* exported functions
+  - send should only send important parts of transaction (eg. no timestamps)
+
 */
-var debugvar;
 // mkPostlock: constructor for the main postlock module.
 var mkPostlock = function (websocket_url) {
 
-    // variable containing for all of postlock
+    // PL: variable containing postlock instance 
     var PL = {
         config: {
             ws_url: websocket_url 
@@ -49,32 +54,30 @@ var mkPostlock = function (websocket_url) {
         // - Utility functions -
         // ---------------------
         util: {
+            create_spec: function(type) {
+                return {
+                    oid: PL.counters.object_id.gensym(),
+                    type: type,
+                };
+            }
+            is_connected: function() {return false;},
             require_transaction: function (fun, t, t_spec) {
-                // there may be a transaction in the arguments
-                var apply_t = false;
+                var ret = {}, apply_t = false;
                 if (!PL.util.is_transaction(t)) {
                     apply_t = true;
                     t = PL.modules.mkTransaction(t_spec);
                 }
-                fun(t);
+                ret = {value: fun(t), transaction: t};
                 if (apply_t) t.apply();
-                return t;
+                return ret;
             },
             // from: http://www.javascriptkit.com/javatutors/arraysort.shtml
             numeric_sort: function (a, b) {
                 return (a - b);
             },
-            create_message: function (message_type) {
-                return {
-                    header: {
-                        id: PL.counters.client_message_id.getint(),
-                        last_server_message_id: PL.counters.last_server_message_id,
-                        message_type: message_type,
-                        ts: {
-                            created:  PL.util.get_timestamp()
-                        }
-                    }
-                };
+            add_message_id: function (header) {
+                header.id = PL.counters.client_message_id.getint();
+                header.last_server_message_id = PL.counters.last_server_message_id;
             },
             // Assembles ack's for applied remote transactions
             // based on the contents of PL.transactions.remote
@@ -83,7 +86,6 @@ var mkPostlock = function (websocket_url) {
                 for (i=0; i < acknowledged_remote_transactions.length; i++) PL.transactions.remove(acknowledged_remote_transactions[i]);
                 return acknowledged_remote_transactions;
             },
-            // From Javascript - The Good Parts
             is_array: function (value) {
                 return value &&
                     typeof value === 'object' &&
@@ -116,7 +118,7 @@ var mkPostlock = function (websocket_url) {
             },
             copy_methods: function (src, dest) {
                 var i;
-                for (i in src) dest[i] = src[i];
+                for (i in src) if (src.hasOwnProperty(i)) dest[i] = src[i];
                 return dest;
             },
             get_timestamp: function () { return +new Date(); },
@@ -126,12 +128,10 @@ var mkPostlock = function (websocket_url) {
                     on_failure = cb_failure || function () {PL.util.throw_ex("retry_until failed", {args: PL.util.args2array(arguments)});},
                     do_try = function (r) {
                         if (condition()) return cb_success();
-                        else if (retries === 0) on_failure();
-                        else {
-                            setTimeout(function () {do_try(r-1);},ms);
-                        }
+                        if (retries === 0) return on_failure();
+                        return setTimeout(function () {do_try(r-1);},ms);
                     };
-                do_try(retries);
+                return do_try(retries);
             },
             // from: http://stackoverflow.com/questions/1068834/object-comparison-in-javascript
             equals: function (t,x) {
@@ -219,29 +219,28 @@ var mkPostlock = function (websocket_url) {
                 if (my.debug) {
                     console.log("Callback manager for " + my.id + " received signal " + signal + " with arguments " + args + ".");
                 }
-                return {fire_user_cb: true};
+                return;
             },
             fire: function (signal, args) {
                 // apply the internal callback first
-                var result = {};
-                var args_array = PL.util.args2array(args);
-                var first_cb;
+                var result = {}, args_array = PL.util.args2array(args), first_cb, mapped_signal;
                 if (signal in my.internal_cb) first_cb = my.internal_cb[signal];
                 else {
                     first_cb = function(a) {return my.default_callback(signal, a);};
                 }
-                result.internal_result = first_cb.apply(this, args_array) || {fire_user_cb: true};
+                result.internal = first_cb.apply(this, args_array) || {};
+                // the internal callback may change the signal for the user-defined callbacks
+                mapped_signal = result.internal.user_signal || signal;
                 // apply the user-defined cb if one exists
-                if (result.internal_result.fire_user_cb && 
-                    (signal in my.user_cb)) {
-                    if (result.internal_result.user_cb_data) args_array.push(result.internal_result.user_cb_data);
-                    result.user_result = my.user_cb[signal].apply(this,args_array);
+                if (!result.internal.skip_user_cb && (mapped_signal in my.user_cb)) {
+                    if (result.internal.user_cb_data) args_array.push(result.internal.user_cb_data);
+                    result.user = my.user_cb[mapped_signal].apply(this,args_array);
                 }
                 return result;
             }
         }; // END my    
 
-        // MODULE EXPORPL
+        // MODULE EXPORTS
         return {
             debug: function (new_debug_state) {my.debug = new_debug_state;},
             set_internal_cb: function (signal, handler) {my.internal_cb[signal] = handler;},
@@ -266,92 +265,99 @@ var mkPostlock = function (websocket_url) {
     PL.modules.mkTransaction = function (spec) {
         spec = spec || {};
         var my = {
-            msg: PL.util.create_message('t'), // a message of type t = transaction 
-            // transaction status-es:
+            msg: spec.msg || {
+                header: {
+                    type: 't' // a message of type t = transaction 
+                },
+                ts: {
+                    created: PL.util.get_timestamp()
+                },
+                transformations: []
+            }, 
+            // transaction states:
             // init - transaction is under composition (initial state)
-            // applying
-            // applied - the transaction has been locally applied, ACK from server pending
-            // acknowledged - the transaction has been acknowledged
-            // aborting
+            // applied - (local only) the transaction has been locally applied, ACK from server pending
+            // acknowledged - the transaction has been acknowledged (for remote transactions this is the same as applied)
             // aborted - the transaction has been rolled back
             current_status: "init",
-            is_remote: spec.is_remote || false
+            is_remote: spec.is_remote || false,
+            fun: {}
         };
 
-        my.msg.transformations = [];
+        my.fun.get_tid = function () {
+            if (my.msg.header.id) return ((my.is_remote)?'s':'c') + my.msg.header.id;
+            return "[none]";
+        };
 
-        my.get_tid = function () {return ((my.is_remote)?'s':'c') + my.msg.header.id;};
-
-        my.make_t_map = function () {
+        my.fun.make_t_map = function () {
             // rearrange transformation list into an
             // object id -> list of commands map.
             var i, oid, t_map = {};
             for (i = 0; i < my.msg.transformations.length; i++) {
-                oid = my.msg.transformations[i].parameters.oid || "meta_object";
+                oid = my.msg.transformations[i].oid;
                 if (!(oid in t_map)) t_map[oid] = [];
                 t_map[oid].push(my.msg.transformations[i]);
             }
             return t_map;
         };
 
-        my.rollback = function () {
-            my.current_status = "aborting";
-            var t_map = arguments[0] || my.make_t_map();
-            var e = arguments[1] || {message: "no reason given", data: {}};
-            console.log("starting rollback of transaction "+my.get_tid()+"; reason: "+e.message);
-            var i;
+        my.fun.rollback = function () {
+            var i, t_map = arguments[0] || my.fun.make_t_map(),
+                e = arguments[1] || {message: "no reason given", data: {}};
+            console.log("starting rollback of transaction "+my.fun.get_tid()+"; reason: "+e.message);
             for (i in t_map) {
                 if (!t_map.hasOwnProperty(i)) continue;
-                PL.objects.get(i).cb.fire('rollback_transaction',[my.get_tid()]);
+                PL.objects.get(i).cb.fire('rollback_transaction',[my.fun.get_tid()]);
             }
             my.current_status = "aborted";
             // unregister transaction
-            delete PL.transactions[my.get_tid()];
+            PL.transactions.get(my.get_tid());
         };
 
-        my.apply_locally = function () {
+        my.fun.apply_locally = function () {
             var i, t_map = my.make_t_map();
             try {
                 for (i in t_map) {
                     if (!t_map.hasOwnProperty(i)) continue;
                     // 'apply_transaction' handler will throw ex if transaction cannot be applied.
-                    PL.objects.get(i).cb.fire("apply_transaction", [my.get_tid(), t_map[i]]);
+                    PL.objects.get(i).cb.fire("apply_transaction", [my.fun.get_tid(), my.is_remote, t_map[i]]);
                 }
                 my.current_status = "applied";
                 return true;
             } catch (e) {
-                my.rollback(t_map, e);
+                my.fun.rollback(t_map, e);
             }
             return true;
         };
-        my.send = function () {
+        my.fun.send = function () {
             PL.outqueue.add_transaction(my.msg);
         };
         my.apply = function () {
-            my.current_status = "applying";
-            if (my.apply_locally()) {
-                if (my.is_remote === true) my.current_status = "acknowledged";
-                else my.send();
+            // add id to local transactions
+            if (!my.msg.header.id) PL.util.add_message_id(my.msg.header);
+            if (my.fun.apply_locally()) {
+                if (my.is_remote) my.current_status = "acknowledged";
+                else my.fun.send();
                 return true;
             }
             return false;
         };
-        my.ack = function () {
-            my.current_status = "acknowledged";
-            var t_map = my.make_t_map();
+        my.fun.ack = function () { // only called for local transactions
+            var t_map = my.fun.make_t_map();
             for (i in t_map) {
                 if (!t_map.hasOwnProperty(i)) continue;
-                PL.objects.get(i).cb.fire("ack_transaction", [my.get_tid()]);
+                PL.objects.get(i).cb.fire("ack_transaction", [my.fun.get_tid()]);
             }
+            my.current_status = "acknowledged";
             // unregister transaction
-            delete PL.transactions.local[my.get_tid()];
+            delete PL.transactions.remove(my.fun.get_tid());
         };
-        // RETURN EXPORPL
+        // RETURN EXPORTS
         var ret = {
             set_current_state: function (new_status) {my.current_status = new_status;},
             get_transformations: function () {return my.msg.transformations;},
-            ack: my.ack,
-            rollback: my.rollback,
+            ack: my.fun.ack,
+            rollback: my.fun.rollback,
             exports: {
                 is_remote: function () {return my.is_remote === true;},
                 add_transformation: function (t) {
@@ -359,10 +365,11 @@ var mkPostlock = function (websocket_url) {
                         PL.util.throw_ex("add_transformation failed: transaction not in init state", t);
                     }
                     my.msg.transformations.push(t);
+                    return t;
                 },
-                get_tid: my.get_tid,
+                get_tid: my.fun.get_tid,
                 get_current_status: function () {return my.current_status+"";},
-                apply: my.apply
+                apply: my.fun.apply
             }
         };
         // register this transaction
@@ -370,35 +377,20 @@ var mkPostlock = function (websocket_url) {
         return ret.exports;
     };
 
-    // TelepathicObject: All postlock datatypes (dicts, lists, and data)
-    // are similar in the sense that they receive change commands
-    // from the server and the local client, manipulate the command queue,
-    // and fire callback events.
-    // This common functionality is factored into a base class, so
-    // specialized classes (dict, list, data) can inherit these capabilities
-    // throught the functional inheritance pattern.
-    // Specific responsibilities of TelepathicObject:
-    // - maintain a callback manager for user callback events
-    // - receive server messages, forward these signals to handlers
-    // - place local state modification commands in queue
-    // - resolve discrepancies in client/server state (this is the BIG issue)
+    // mkPostlockObject: base module for all postlock datatypes (dicts, lists, and data)
+    // Specific responsibilities of this module:
+    // - initialize callback manager with sensible default callbacks
+    // - finish descendant objects (see add_base_exports)
     PL.modules.mkPostlockObject = function (spec) {
         // spec format: {
         //      string oid: (optional)
         //      string type: "dict" || "list" || "data" (mandatory)
-        //      object fun, where:
-        //      fucntion: fun.remote_transformation
         // }
-        var object_id = spec.oid;
-        if (!object_id) {
-            // throw exception if connection is not alive yet
-            if (PL.counters.object_id.get_prefix().length == 0) PL.util.throw_ex("postlock not yet connected!", {spec: spec}); 
-            object_id = PL.counters.object_id.gensym();
-        }
         // MODULE DATA:
         var my = {
+            type: spec.type,
             // unique ID of object
-            oid: object_id,
+            oid: spec.oid,
             // callback manager, which is shared with the descendant object
             cb: spec.cb || PL.modules.mkCallbackManager({name: spec.type+"#"+object_id}),
         };
@@ -418,46 +410,34 @@ var mkPostlock = function (websocket_url) {
             // TODO: fire event instead!
             return spec.fun.remote_transformation(message);
         });
-        my.cb.set_internal_cb("apply_transaction", function(tid, transformations) {
+        my.cb.set_internal_cb("apply_transaction", function(tid, is_remote, transformations) {
             var i, results = [];
             for (i = 0; i < transformations.length; i++) {
-                results.push(my.cb.fire(transformations[i].command, [tid, transformations[i].parameters]));
+                results.push(my.cb.fire(transformations[i].command, [tid, is_remote, transformations[i]]));
             }
             return results;
         });
  
-        // EXPORPL
+        // EXPORTS
         my.exports = {
                 get_oid: function () {return my.oid+'';},
-                get_type: function () {return spec.type+'';},
+                get_type: function () {return my.type+'';},
                 set_cb: my.cb.set_user_cb,
             };
         return {
             cb: my.cb,
             exports: my.exports,
-            finish_object: function (desc, parameters, transaction) {
+            add_base_exports: function (desc) {
                 desc.exports = desc.exports || {};
                 PL.util.copy_methods(my.exports, desc.exports);
-                // add object to objects
-                PL.objects[desc.exports.get_oid()] = desc;
-                // if no transaction was specified or transaction is local,
-                // add 'create' transformation.
-                if (!transaction.is_remote()) {
-                    parameters = parameters || {};
-                    parameters.type = spec.type;
-                    parameters.oid = my.oid;
-                    transaction.add_transformation(
-                        PL.objects.get("meta_object").create_transformation(
-                            'create', parameters));
-                }
                 return desc;
             },
-            create_transformation: function (command, parameters, transaction) {
+            add_transformation: function (command, parameters, transaction) {
                 parameters = parameters || {};
-                parameters.oid = my.oid;
                 return PL.util.require_transaction(
                     function (t) {
-                        t.add_transformation({
+                        return t.add_transformation({
+                            oid: my.oid,
                             command: command,
                             parameters: parameters});},
                             transaction);}
@@ -466,61 +446,66 @@ var mkPostlock = function (websocket_url) {
 
     // Metaobject is the postlock object that gets invoked if
     // no object id is given for a transaction (eg: object creation).
-    PL.modules.mkMetaObject = function (spec, transaction) {
-        var my = {
+    // mkMetaObject does not run within a transaction.
+    PL.modules.mkMetaObject = function (spec) {
+        spec = spec || {};
+        spec.oid = "meta_object";
+        spec.type = "meta";
+        var i,my = {
             unacked_objects: {},
             pending_transactions: {},
-            base: PL.modules.mkPostlockObject({
-                    transaction: spec.transaction,
-                    oid: "meta_object", 
-                    type: "meta",
-                    fun: {
-                        transactions: {
-                            ack: function (tid) {
-                            },
-                            rollback: function (tid) {
-                            },
-                            apply: function (tid, transformations) {
-                                // objects are added to objects when they are created,
-                                // so apply simply adds them to unacked_objects if tid is local.
-                                if (!PL.transactions.get(tid).is_remote()){ 
-                                    for (var i = 0; i < transformations.length; i++) {
-                                        // if the transaction is local, add newly created object to
-                                        // pending objects
-                                        if (transformations[i].command === "create") {
-                                            my.unacked_objects[transformations[i].oid] = tid;
-                                            if (!(tid in my.pending_transactions)) my.pending_transactions[tid] = [];
-                                            my.pending_transactions[tid].push(transformations[i].oid);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+            base: PL.modules.mkPostlockObject(spec),
+            fun: {
+                create_new_object: function(spec) {
+                    var newobj;
+                    switch (spec.type) {
+                        case 'data':
+                            newobj = PL.modules.mkData(spec);
+                            break;
+                        case 'dict':
+                            newobj = PL.modules.mkDict(spec);
+                            break;
+                        default:
+                            PL.util.throw_ex("cannot create object based on spec", spec);
                     }
-                })
+                    return newobj;
+                }
+            }
         };
+        
+        my.base.cb.set_internal_cb('apply_transaction', function(tid, is_remote, transformations) {
+            var newobj, i;
+            if (!PL.transactions.get(tid).is_remote()){ 
+                for (i = 0; i < transformations.length; i++) {
+                    // if the transaction is local, add newly created object to
+                    // pending objects
+                    if (transformations[i].command === "create") {
+                        // TODO: fail in case an object with that OID already exists (but
+                        // this normally wont happen).
+                        newobj = my.fun.create_new_object(transformations[i].parameters.spec)
+                        // register freshly created object
+                        PL.objects.set(newobj.exports.get_oid(), newobj);
+                        // If transaction is local, add freshly created objects to unacked_objects.
+                        if (!is_remote) {
+                            my.unacked_objects[transformations[i].oid] = tid;
+                            if (!(tid in my.pending_transactions)) my.pending_transactions[tid] = [];
+                            my.pending_transactions[tid].push(transformations[i].oid);
+                        }
+                   }
+                }
+            }
+        });
         var ret = {
-            create_transformation: function (command, parameters) {
-                return {
-                    command: command,
-                    parameters: parameters
-                };
-            },
-            exports: {},
-            transactions: {}
+            add_transformation: my.base.add_transformation, 
         };
-        PL.util.require_transaction(
-            function (t) {
-                my.base.finish_object(ret, {}, t)},
-            transaction);
+        my.base.add_base_exports(ret);
         return ret;
    };
  
     // Data module for postlock data nodes.
-    PL.modules.mkData = function (spec, transaction) {
+    PL.modules.mkData = function (spec) {
         // MODULE FIELDS:
-        spec = spec || {};
-        spec.type = 'data';
+        spec = spec || PL.util.create_spec('data');
         var my = {
             base: PL.modules.mkPostlockObject(spec),
             pending_set: undefined, // pending transaction {tid: tid, value: value}
@@ -535,7 +520,7 @@ var mkPostlock = function (websocket_url) {
         };
 
         my.fun.do_set = function (val, force, transaction) {
-            var t = my.base.create_transformation(
+            var t = my.base.add_transformation(
                 'set', {value: val, force: force},
                 transaction);
             my.pending_set = {tid: t.get_tid(), value: val};
@@ -555,15 +540,15 @@ var mkPostlock = function (websocket_url) {
                 // remote case - only act if there are pending local set(s).
                 if (!my.pending_set) {
                     my.value = parameters.value;
-                    return {fire_user_cb: true, user_cb_data: user_cb_data};
+                    return {user_cb_data: user_cb_data};
                 }
             } else {
                 // local case - apply set & register pending transaction.
                 my.pending_set = {tid: tid, value: parameters. value};
-                return {fire_user_cb: true, user_cb_data: user_cb_data};
+                return {user_cb_data: user_cb_data};
             }
             // Do nothing
-            return {fire_user_cb: false};
+            return {skip_user_cb: true};
         });
        
         var ret = {
@@ -575,18 +560,14 @@ var mkPostlock = function (websocket_url) {
             },
         };
 
-        PL.util.require_transaction(
-            function (t) {
-                my.base.finish_object(ret, {value: my.value},t)},
-            transaction);
+        my.base.add_base_exports(ret),
         return ret;
    };
 
     // Dict module for postlock dict nodes.
-    PL.modules.mkDict = function (spec, transaction) {
+    PL.modules.mkDict = function (spec) {
         // MODULE FIELDS:
-        spec = spec || {};
-        spec.type = 'dict';
+        spec = spec || PL.util.create_spec('dict');
         var my = {
             base: PL.modules.mkPostlockObject(spec),
             fun: {
@@ -612,13 +593,13 @@ var mkPostlock = function (websocket_url) {
             pending_new: {}
         };
         my.fun.do_set = function (key, child_oid, force, transaction) {
-            return my.base.create_transformation(
+            return my.base.add_transformation(
                 'set', {
                         key: key,
                         value: child_oid,
                         force: force});};
         my.fun.do_remove = function (key, force, transaction) {
-            return my.base.create_transformation(
+            return my.base.add_transformation(
                 'remove', {
                         key: key,
                         force: force});};
@@ -655,21 +636,21 @@ var mkPostlock = function (websocket_url) {
                 ((int_key in my.data || int_key in my.pending_new));};
 
         my.base.cb.set_internal_cb("remove", function (tid, parameters) {
-            var int_key = my.fun.to_internal_key(parameters.key), fire_user_cb = true;
+            var int_key = my.fun.to_internal_key(parameters.key), skip_user_cb = false;
             if (PL.transactions.get(tid).is_remote()) {
                 // remote case - delete from my.data if there is no pending set on key
                 if (!my.fun.has_pending_set(int_key) && (int_key in my.data)) delete my.data[int_key];
                 // only execute user_cb if there is no pending local delete for key
-                fire_user_cb = !(int_key in my.pending_remove);
+                skip_user_cb = (int_key in my.pending_remove);
             } else {
                 // local case
                 my.pending_remove[int_key] = tid;
             }
-            return {fire_user_cb: fire_user_cb};
+            return {skip_user_cb: skip_user_cb};
         });
 
         my.base.cb.set_internal_cb("set", function (tid, parameters) {
-            var int_key = my.fun.to_internal_key(parameters.key), user_cb_data, fire_user_cb = true;
+            var int_key = my.fun.to_internal_key(parameters.key), user_cb_data, skip_user_cb = false;
             if (my.fun.has_key(parameters.key)) user_cb_data.old_value = my.fun.get(parameters.key);
             user_cb_data.new_value = parameters.value;
 
@@ -677,7 +658,7 @@ var mkPostlock = function (websocket_url) {
                 // remote case
                 my.data[int_key] = parameters.value;
                 // fire user cb if no pending local sets exist for key
-                fire_user_cb = !my.fun.has_pending_set(int_key);
+                skip_user_cb = my.fun.has_pending_set(int_key);
             } else {
                 // local case
                 // undo pending removal of key (if applicable).
@@ -690,7 +671,7 @@ var mkPostlock = function (websocket_url) {
                     my.pending_new[int_key] = {tid: tid, parameters: parameters};
                 }
             }
-            return {fire_user_cb: fire_user_cb, user_cb_data: user_cb_data};
+            return {skip_user_cb: skip_user_cb, user_cb_data: user_cb_data};
         });
 
         my.base.cb.set_internal_cb('ack_transaction', function(tid) {
@@ -711,11 +692,8 @@ var mkPostlock = function (websocket_url) {
                 has_key: my.fun.has_key           
            }
        };
-       // register newly created object
-       PL.util.require_transaction(
-            function (t) {
-                my.base.finish_object(ret, {}, t)},
-            transaction);
+
+       my.base.add_base_exports(ret);
        return ret;
    };
 
@@ -731,60 +709,70 @@ var mkPostlock = function (websocket_url) {
             // websocket object
             connection: null, 
             cb: PL.modules.mkCallbackManager({name:"main postlock object"}),
-            state_list: {
-                INACTIVE: 0,
-                AUTH: 1,
-                CONNECTED: 2
-            },
-            state: 0,
-        };
+            // These are roughly equivalent to the states that are used in the sync server (plSync.erl)
+            state: {state: 'idle'},
+            fun: {
+                connection_state_change: function(message, new_state) {
+                    var oldstate = my.state;
+                    my.state = new_state;
+                    // update current handle_incoming_msg function
+                    if (my.state.substate) my.fun.handle_incoming_msg.current = my.fun.handle_incoming_msg[my.state.state][my.state.substate];
+                    else my.fun.handle_incoming_msg.current = my.fun.handle_incoming_msg[my.state.state];
+                    my.cb.fire("connection_state_change", [oldstate, new_state, message]);
+                },
+                websocket_safe_send: function (data) {
+                    PL.util.retry_until(
+                        // condition
+                        function () { return PL.connection.readyState == 1;},
+                        // on success
+                        function () {
+                            console.log("just sent " + data);
+                            PL.connection.send(data);
+                        }
+                    );
+                },
+                create_object: function(spec, transaction) {
+                    var result; 
+                    result = PL.objects.get("meta_object").add_transformation(
+                        'create', {spec: spec}, transaction);
+                    // if the transaction has already been applied, then return
+                    // the newly created object.
+                    if (result.transaction.get_current_status() === 'applied') {
+                        return PL.objects.get(result.value.parameters.spec.oid).exports;
+                    }
+                    return result;
+                },
+                // handle_incoming_msg.current is overwritten when a state change requires incoming messages
+                // to be handled in a new way. The handler for each state/substate is under
+                // handle_incoming_msg.state.substate or just .state if there is no substate.
+                handle_incoming_msg: {
+                    current: function(msg_obj) {PL.util.throw_ex("not yet connected", msg_obj)},
+                    client_init: {
+                        get_client_id: function (msg_obj) {
+                            if ("client_id" in msg_obj) {
+                                PL.config.client_id = msg_obj.client_id;
+                                PL.counters.object_id.set_prefix(msg_obj.client_id + ".");
+                                my.fun.connection_state_change(msg_obj, {state: 'client_init', substate: 'inital_copy'});
+                            }
+                            else pl.util.throw_ex("expected client id, received " + JSON.stringify(msg_obj));
+                        },
+                        initial_copy: function (msg_obj) {
+                            // TODO: perform initial copy...
+                            console.log("STUB: handle_incoming_msg.client_init.initial_copy got " + JSON.stringify(msg_obj));
+                            // transition to connected state:
+                            // update is_connected()
+                            PL.util.is_connected = function() {return true;};
+                            // update state
+                            my.fun.connection_state_change(msg_obj, {state: 'connected'});
+                        }
+                    },
+                    connected: function (msg_obj) {
+                        console.log("STUB: handle_incoming_msg.connected got " + JSON.stringify(msg_obj));
+                    }
+                }   // end handle_incoming_msg
+            }       // end fun
+        };          // end my
         my.cb.debug(true); // for DEVEL: debug main CB manager.
-
-        my.transform_object = function (msg) {
-            if (!(msg.oid in PL.objects)) PL.util.throw_ex("Unknown object id: " + msg.oid);
-            return PL.objects[msg.oid].cb.fire("server_message", msg);
-        };
-
-        my.websocket_safe_send = function (data) {
-            PL.util.retry_until(
-                // condition
-                function () { return PL.connection.readyState == 1;},
-                // on success
-                function () {
-                    console.log("just sent " + data);
-                    PL.connection.send(data);
-                }
-            );
-        };
-
-        // Callback functions
-        my.handle_incoming_message = [];
-        my.handle_incoming_message[my.state_list.AUTH] = function (msg_obj) {
-            // TODO: respond to authentication challenge
-            // Right now, there's no authentication, we assume it succeeded:
-            if ("client_id" in msg_obj) {
-                PL.config.client_id = msg_obj.client_id;
-                PL.counters.object_id.set_prefix(msg_obj.client_id + ".");
-                my.state = my.state_list.CONNECTED;
-                my.cb.fire("connection_state_change", [my.state]);
-            }
-            else console.error("expected client id, received " + JSON.stringify(msg_obj));
-        };
-        my.handle_incoming_message[my.state_list.CONNECTED] = function (msg_obj) {
-            // should we create an object?
-            for (var i = 0; i < msg_obj.length; i++) {
-                var msg = msg_obj[i];
-                if (msg.action === "create") {
-                    my.create_object(msg);
-                    continue;
-                }
-                if (msg.action === "transform") {
-                    my.transform_object(msg);
-                    continue;
-                }
-                PL.util.throw_ex ("Unknown message type received");
-            }
-        };
 
         // handle incoming message from server
         my.cb.set_internal_cb("ws_onopen", function () {
@@ -795,10 +783,15 @@ var mkPostlock = function (websocket_url) {
                 },
                 // on success
                 function () {
+                    // TODO: no authentication scheme implemented yet
                     PL.connection.send("client-connected");
-                    my.state = my.state_list.AUTH;
+                    // update state
+                    my.fun.connection_state_change({}, {state: 'client_init', substate: 'get_client_id'});
                 }
             );
+            // We don't want users hooking into ws_onopen.
+            // Use the 'connection_state_change' event instead.
+            return {skip_user_cb: true};
         });
         my.cb.set_internal_cb("ws_onmessage", function (msg) {
             console.log(msg.timeStamp + " - received: '" + msg.data + "'");
@@ -806,13 +799,13 @@ var mkPostlock = function (websocket_url) {
             try {
                 t = JSON.parse(msg.data);
             } catch (e) {
-                console.error("parse error: " + e.message + " input: " + msg);
+                console.error("parse error: " + e.message + " input: " + msg.data);
             }
             // apply server transformation
             if (t !== null)  {
                 my.handle_incoming_message[my.state](t);
             }
-            else console.log("failed to parse incoming message '" + msg+"'");
+            else console.log("failed to parse incoming message '" + msg.data +"'");
         });
         my.cb.set_internal_cb("ws_onclose", function () {
             // TODO: attempt to re-open the connection
@@ -824,17 +817,9 @@ var mkPostlock = function (websocket_url) {
             console.log("ws_error fired, arguments: " + PL.util.args2array(arguments));
         });
 
-        // CREATE root element and meta-object
-        // my.root is created in a remote transaction so the server doesn't receive
-        // the transaction.
-        var mk_root_t = PL.modules.mkTransaction({is_remote: true});
-        PL.modules.mkMetaObject({cb: my.cb}, mk_root_t);
-        my.root = PL.modules.mkDict({oid: '0.0'}, mk_root_t);
-        mk_root_t.apply();
-        // meta-object and root's don't need to be acknowledged, so we delete these
-        // transactions:
+        // CREATE meta-object
+        PL.objects.set("meta_object", PL.modules.mkMetaObject({cb: my.cb}));
         
-
         PL.outqueue.add_transaction = function (t) {
             t.header.ts.queued = PL.util.get_timestamp();
             t.response = {
@@ -847,12 +832,11 @@ var mkPostlock = function (websocket_url) {
             while (PL.outqueue.length > 0) {
                 var t = PL.outqueue.shift();
                 t.header.ts.sent = PL.util.get_timestamp();
-                my.websocket_safe_send(JSON.stringify(t));
+                my.fun.websocket_safe_send(JSON.stringify(t));
             }
         };
  
-        // EXPORPL:
-        // master dictionary manipulation (for internal use only):
+        // EXPORTS:
         var exports = {
             // ---- exports methods ----
            connect: function () {
@@ -865,14 +849,22 @@ var mkPostlock = function (websocket_url) {
                 return exports;
                 },
            disconnect: function () {},
-           root: my.root.exports,
            set_cb: my.cb.set_user_cb,
-           make_data: function (initial_value, transaction) {return (PL.modules.mkData({value: initial_value}, transaction)).exports;},
-           make_dict: function (transaction) {return PL.modules.mkDict({}, transaction).exports;},
-           make_transaction: function () {return PL.modules.mkTransaction().exports;}
+           make_data: function (initial_value, transaction) {
+               var spec = PL.util.create_spec('data');
+               spec.value = initial_value
+               return my.fun.create_object(spec, transaction);
+           },
+           make_dict: function (transaction) {
+               var spec = PL.util.create_spec('dict');
+                return my.fun.create_object(spec, transaction);
+           },
+           make_transaction: function () {
+               return PL.modules.mkTransaction().exports;
+           }
            // make_list
         };
-        // RETURN EXPORPL
+        // RETURN EXPORTS
         return exports;
     }; // END of module Main
 

@@ -27,7 +27,7 @@
         connected/2, connected/3, 
         handle_event/3, handle_sync_event/4, handle_info/3, terminate/3,
         code_change/4]).
-
+-include("plState.hrl").
 -record(state, {
           % The id of the client.
           client_id,
@@ -126,7 +126,7 @@ client_init(_Event, _From, State) ->
 
 connected({client_message, {ok, Msg}}, State) ->
     % Message is the json-decoded term received from the client
-    io:format("connected/2 got client message ~p~n",[Msg]),
+    io:format("connected/2 got client message ~p~n",[json_to_transaction(Msg)]),
     {next_state, connected, State};
 connected({client_message, Msg}, State) ->
     % Message is the json-decoded term received from the client
@@ -244,12 +244,42 @@ process_pending_transformation(_Transformation, State) ->
 %%--------------------------------------------------------------------
 %%% Input message parsing functions
 %%--------------------------------------------------------------------
-json_to_transaction({struct, JsonMessage}) ->
+json_to_transaction(JsonMessage) ->
     try
-        Header = lists:keyfind(header, 1, JsonMessage),
-        Transformations = lists:keyfind(transformations, 1, JsonMessage),
-        Response = lists:keyfind(response, 1, JsonMessage),
-        #postlock_transaction{}
+        {ok, Id} = json_get_value([header, id], JsonMessage),
+        {_, AckList} = json_get_value([response, ack], JsonMessage, []),
+        {ok, {array, Tlist}} = json_get_value([transformations], JsonMessage),
+        {ok, #postlock_transaction{
+            id=Id,
+            ack = AckList,
+            transformations = lists:map(fun interpret_transformation/1, Tlist)
+        }}
     catch
-        _:_ -> {error, "failed to parse transaction", JsonMessage}
+        _:_ -> {error, ["failed to parse transaction", JsonMessage]}
     end.
+json_get_value(KeyList, JsonMessage) ->
+    try
+        {ok, json_get_value_1(KeyList, JsonMessage)}
+    catch
+        _:_ -> {error, ["Error getting key list from JSON message", KeyList, JsonMessage]}
+    end.
+json_get_value(KeyList, JsonMessage, DefaultValue) ->
+    try
+        {ok, json_get_value_1(KeyList, JsonMessage)}
+    catch
+        _:_ -> {default, DefaultValue}
+    end.
+json_get_value_1([], Value) -> Value;
+json_get_value_1([Key|KeyList], {struct,Entries}) ->
+    {Key, Value} = lists:keyfind(Key, 1, Entries),
+    json_get_value(KeyList, Value).
+interpret_transformation(TMsg) ->
+    {ok, Cmd} = json_get_value([command], TMsg),
+    {_, Oid} = json_get_value([parameters, oid], TMsg, none),
+    {_, {struct, ParamList}} = json_get_value([parameters], TMsg, {struct, []}),
+    #postlock_transformation{
+        cmd = Cmd,
+        oid = Oid,
+        parameters = ParamList
+    }.
+

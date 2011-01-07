@@ -40,9 +40,9 @@ start_link() ->
 %%--------------------------------------------------------------------
 init([]) ->
     % TODO: read state from mnesia
+    process_flag(trap_exit, true),
     make_tables(),
     fill_tables(),
-    process_flag(trap_exit, true),
     {ok, []}.
 
 %%--------------------------------------------------------------------
@@ -56,10 +56,9 @@ init([]) ->
 %%--------------------------------------------------------------------
 %% Creates a new sync server with a brand new client id, then registers
 %% the sync server with the state server responsible for the session.
-handle_call({new_client, SessionId, WebSocketOwner}, _From, State) ->
+handle_call({new_client, SessionId, WebSocketData}, _From, State) ->
     % TODO: maybe we should wrap this in a try block
-    Reply = create_sync_server(SessionId, WebSocketOwner),
-    {reply, Reply, State};
+    {reply, create_sync_server(SessionId, WebSocketData), State};
 
 handle_call({new_session, CallbackServer}, _From, State) ->
     Reply = create_state_server(CallbackServer),
@@ -86,9 +85,9 @@ handle_cast(Msg, State) ->
 %%                                       {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
-handle_info({'EXIT', Pid, _Reason}, State) ->
+handle_info({'EXIT', Pid, Reason}, State) ->
     %% Todo: handle EXIT messages from sync and state servers!
-    io:format("Sync/State server with PID ~p died! TODO: restart server, update mnesia!~n",[Pid]),
+    io:format("Sync/State server with PID ~p died! Reason: ~p~nTODO: restart server, update mnesia!~n",[Pid, Reason]),
     {noreply, State};
 
 handle_info(Info, State) ->
@@ -147,7 +146,7 @@ get_next_client_id(SessionId) ->
 %% The postlock_session.clients field in mnesia corresponding to the
 %% given SessionId is updated to include the new sync server.
 %%--------------------------------------------------------------------
-create_sync_server(SessionId, WebSocketOwner) ->
+create_sync_server(SessionId, WebSocketData) ->
     % get client id for new client.
     ClientId = get_next_client_id(SessionId),
     % TODO: handle case where SessionId does not refer to a valid
@@ -156,18 +155,22 @@ create_sync_server(SessionId, WebSocketOwner) ->
         [Rec] = mnesia:read(postlock_session, SessionId),
         Rec#postlock_session.state_server
     end),
-    % spawn the new state server:
+    % spawn the new sync server:
     % TODO: handle cases where {error, Reason} is returned
-    {ok, NewSyncServer} = plSync:start_link([WebSocketOwner, StateServer, ClientId]),
-    % update record for current session in mnesia
-    F = fun() ->
-        [SessionRec] = mnesia:read({postlock_session, SessionId}),
-        NewSessionRec = SessionRec#postlock_session{clients=
-            gb_trees:enter(ClientId, NewSyncServer, SessionRec#postlock_session.clients)},
-        mnesia:write(NewSessionRec)
-    end,
-    mnesia:transaction(F),
-    {NewSyncServer, ClientId}.
+    case plSync:start_link([StateServer, ClientId, WebSocketData]) of
+        {ok, NewSyncServer} ->
+            % update record for current session in mnesia
+            F = fun() ->
+                [SessionRec] = mnesia:read({postlock_session, SessionId}),
+                NewSessionRec = SessionRec#postlock_session{clients=
+                    gb_trees:enter(ClientId, NewSyncServer, SessionRec#postlock_session.clients)},
+                mnesia:write(NewSessionRec)
+            end,
+            mnesia:transaction(F),
+            {ok, NewSyncServer, ClientId};
+        {error, Reason} ->
+            {error, {sync_server_init_error, Reason}}
+    end.
 
 %%--------------------------------------------------------------------
 %% Function: create_state_server(CallbackServer) -> 

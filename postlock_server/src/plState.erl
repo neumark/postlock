@@ -50,6 +50,7 @@ init([SessionId, CallbackServer]) ->
     process_flag(trap_exit, true),
     make_session_tables(SessionId), 
     create_root_node(SessionId),
+    io:format("****** starting state server *****~n", []),
     {ok, #state{
         sessionid = SessionId,
         callback = CallbackServer

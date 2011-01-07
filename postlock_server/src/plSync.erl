@@ -21,26 +21,36 @@
 -export([start_link/1]).
 
 %% gen_fsm callbacks
--export([init/1, 
+-export([
         % state functions
-        client_init/2, client_init/3, 
-        connected/2, connected/3, 
+        idle/2, idle/3,
+        auth/2, auth/3,
+        initial_copy/2, initial_copy/3,
+        connected/2, connected/3,
+        % other functions
+        connect_websocket/2,
+        websocket_owner/2,
+        % standard gen_fsm exports
         handle_event/3, handle_sync_event/4, handle_info/3, terminate/3,
-        code_change/4]).
+        code_change/4, init/1]).
+
 -include("plState.hrl").
+-include("plMessage.hrl").
+-include("yaws_api.hrl").
+
 -record(state, {
           % The id of the client.
           client_id,
+          % low-level websocket data from YAWS
+          websocket_data,
           % The PID of the process which owns the websocket, used to
           % push data to the client.
           websocket_owner,
           % PID of the state server, which we forward transactions to
           % and get updates from
-          state_server,
-          % substate
-          substate
+          state_server
 }).
-
+-define(DEFAULT_TIMEOUT, 100000).
 %%====================================================================
 %% API
 %%====================================================================
@@ -65,84 +75,95 @@ start_link(ServerData) ->
 %% gen_fsm:start_link/3,4, this function is called by the new process to 
 %% initialize. 
 %%--------------------------------------------------------------------
-init([WS_owner, State_server, Client_id]) ->
-    % Trigger initial replication of state data to client.
-    gen_fsm:send_event(self(), trigger),
-    {ok, client_init, #state{
-           client_id = Client_id,
-           websocket_owner = WS_owner,
-           state_server = State_server,
-           substate = initial_copy
-          }}.
+init([StateServer, ClientId, {websocket, ArgsHeaders, SessionId}]) ->
+    process_flag(trap_exit, true),
+    % Initialize websocket
+    case connect_websocket(ArgsHeaders, SessionId) of
+        {ok, WebSocketOwner} ->
+            {ok, idle, #state{
+                   client_id = ClientId,
+                   websocket_owner = WebSocketOwner,
+                   state_server = StateServer
+             }, ?DEFAULT_TIMEOUT}; 
+        {error, Reason} ->
+            {stop, {websocket_error, Reason}}
+    end.
 
 %%--------------------------------------------------------------------
-%% === STATE: client_init ===
-%% This is the initial state of the server. We remain in this
-%% state until the client's state is "up to speed". Then, we advance
-%% to 'connected'.
+%% state: idle 
 %%--------------------------------------------------------------------
 
-% Copies server state to client.
-client_init(trigger, State) when State#state.substate == initial_copy ->
-    % Find the number of objects we are going to copy
-    % and send this + the client ID to the client.
-    NumPublicObjects = gen_server:call(State#state.state_server, {get_num_public_objects}),
-    Msg = "{\"client_id\":" ++ erlang:integer_to_list(State#state.client_id) ++ ", " ++
-          "\"num_public_objects\":" ++ erlang:integer_to_list(NumPublicObjects) ++ "}",
-    State#state.websocket_owner ! {send, Msg},
-    NewState = do_initial_copy(State),
-    gen_fsm:send_event(self(), copy_finished),
-    {next_state, client_init, NewState#state{substate=forward_pending_transformations}};
+idle({client_message, Msg}, State) when Msg#postlock_message.type == "client_connect" ->
+    % put websocket in active mode
+    State#state.websocket_owner ! {set_active_mode},
+    % send server_connect message
+    State#state.websocket_owner ! {send, plMessage:make_message("server_connect")},
+    % send auth_challenge, which puts client in auth state.
+    State#state.websocket_owner ! {send, plMessage:make_message("auth_challenge")},
+    {next_state, auth, State, ?DEFAULT_TIMEOUT};
 
-% Forward the pending server transactions which have accumulated while
-% do_initial_copy was running and which have not yet been applied to the
-% objects replicated to the client.
-client_init({message, server, Msg}, State) when State#state.substate == forward_pending_transformations ->
-    % Find the number of objects we are going to copy
-    % and send this + the client ID to the client.
-    process_pending_transformation(Msg,State),
-    {next_state, client_init, State};
+idle(Event, State) ->
+    io:format("plSync:idle/2 got unexpected event ~p~n", [Event]),
+    {next_state, idle, State}.
 
-% No more waiting transformations, move to 'connected' state.
-client_init(copy_finished, State) when State#state.substate == forward_pending_transformations ->
-    {next_state, connected, State#state{substate=none}};
+idle({get_websocket_owner}, _From, State) ->
+    {reply, State#state.websocket_owner, idle, State};
 
-% If another message comes in, issue a warning: not perpared for anything else!
-client_init(UnhandledMsg, State) when State#state.substate == forward_pending_transformations ->
-    error_logger:warning_report("Got plSync:client_init got bad message in forward_pending_transformations", UnhandledMsg).
-
-client_init(_Event, _From, State) ->
+idle(Event, _From, State) ->
     % NOT USED
-    Reply = ok,
-    {reply, Reply, state_name, State}.
+    io:format("plSync:idle/3 got unexpected event ~p~n", [Event]),
+    {reply, ok, idle, State}.
 
 %%--------------------------------------------------------------------
-%% === STATE: connected ====
-%% This is the state of the server once initial transfer of server
-%% state has been completed. Only the async version (connected/2) is
-%% used. 
-%% Event should be {client_message|state_server_message, Message}.
+%% state: auth
 %%--------------------------------------------------------------------
 
-connected({client_message, {ok, Msg}}, State) ->
-    % Message is the json-decoded term received from the client
-    io:format("connected/2 got client message ~p~n",[json_to_transaction(Msg)]),
-    {next_state, connected, State};
-connected({client_message, Msg}, State) ->
-    % Message is the json-decoded term received from the client
-    io:format("connected/2 got unparseable client message ~p~n",[Msg]),
+auth({client_message, Msg}, State) when Msg#postlock_message.type == "auth_response" ->
+    NumPublicObjects = gen_server:call(State#state.state_server, {get_num_public_objects}),
+    OutMsg = plMessage:make_message("client_data", [], 
+        {struct, [{"client_id", State#state.client_id}, {"num_objects", NumPublicObjects}]}),
+    State#state.websocket_owner ! {send, OutMsg},
+    NewState = do_initial_copy(State),
+    {next_state, initial_copy, NewState};
+
+auth(Event, State) ->
+    io:format("plSync:auth/2 got unexpected event ~p~n", [Event]),
+    {next_state, auth, State}.
+
+auth(Event, _From, State) ->
+    io:format("plSync:auth/3 got unexpected event ~p~n", [Event]),
+    {reply, ok, auth, State}.
+
+%%--------------------------------------------------------------------
+%% state: initial_copy
+%%--------------------------------------------------------------------
+
+initial_copy({client_message, Msg}, State) when Msg#postlock_message.type == "ack_copy" ->
+    % TODO: STUB
+    State#state.websocket_owner ! {send, plMessage:make_message("transaction")},
+    {next_state, initial_copy, State};
+
+initial_copy({client_message, Msg}, State) when Msg#postlock_message.type == "ack_transactions" ->
     {next_state, connected, State};
 
-connected({state_server_message, Msg}, State) ->
-    io:format("connected/2 got server message ~p~n",[Msg]),
+initial_copy(Event, State) ->
+    io:format("plSync:initial_copy/2 got unexpected event ~p~n", [Event]),
+    {next_state, initial_copy, State}.
+
+initial_copy(Event, _From, State) ->
+    io:format("plSync:initial_copy/3 got unexpected event ~p~n", [Event]),
+    {reply, ok, initial_copy, State}.
+
+%%--------------------------------------------------------------------
+%% state: connected
+%%--------------------------------------------------------------------
+connected(Event, State) ->
+    io:format("plSync:connected/2 got unexpected event ~p~n", [Event]),
     {next_state, connected, State}.
 
-
-% NOT USED
-connected(_Event, _From, State) ->
-    Reply = ok,
-    {reply, Reply, state_name, State}.
-
+connected(Event, _From, State) ->
+    io:format("plSync:connected/3 got unexpected event ~p~n", [Event]),
+    {reply, ok, connected, State}.
 
 %%--------------------------------------------------------------------
 %% Function: 
@@ -209,7 +230,7 @@ code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
 
 %%--------------------------------------------------------------------
-%%% Internal functions
+%% Internal functions
 %%--------------------------------------------------------------------
 
 %%--------------------------------------------------------------------
@@ -242,13 +263,13 @@ process_pending_transformation(_Transformation, State) ->
     State.
    
 %%--------------------------------------------------------------------
-%%% Input message parsing functions
+%% Input message parsing functions
 %%--------------------------------------------------------------------
 json_to_transaction(JsonMessage) ->
     try
-        {ok, Id} = json_get_value([header, id], JsonMessage),
-        {_, AckList} = json_get_value([response, ack], JsonMessage, []),
-        {ok, {array, Tlist}} = json_get_value([transformations], JsonMessage),
+        {ok, Id} = plMessage:json_get_value([header, id], JsonMessage),
+        {_, AckList} = plMessage:json_get_value([body, response, ack], JsonMessage, []),
+        {ok, {array, Tlist}} = plMessage:json_get_value([body, transformations], JsonMessage),
         {ok, #postlock_transaction{
             id=Id,
             ack = AckList,
@@ -257,29 +278,82 @@ json_to_transaction(JsonMessage) ->
     catch
         _:_ -> {error, ["failed to parse transaction", JsonMessage]}
     end.
-json_get_value(KeyList, JsonMessage) ->
-    try
-        {ok, json_get_value_1(KeyList, JsonMessage)}
-    catch
-        _:_ -> {error, ["Error getting key list from JSON message", KeyList, JsonMessage]}
-    end.
-json_get_value(KeyList, JsonMessage, DefaultValue) ->
-    try
-        {ok, json_get_value_1(KeyList, JsonMessage)}
-    catch
-        _:_ -> {default, DefaultValue}
-    end.
-json_get_value_1([], Value) -> Value;
-json_get_value_1([Key|KeyList], {struct,Entries}) ->
-    {Key, Value} = lists:keyfind(Key, 1, Entries),
-    json_get_value(KeyList, Value).
 interpret_transformation(TMsg) ->
-    {ok, Cmd} = json_get_value([command], TMsg),
-    {_, Oid} = json_get_value([parameters, oid], TMsg, none),
-    {_, {struct, ParamList}} = json_get_value([parameters], TMsg, {struct, []}),
+    {ok, Cmd} = plMessage:json_get_value([command], TMsg),
+    {_, Oid} = plMessage:json_get_value([parameters, oid], TMsg, none),
+    {_, {struct, ParamList}} = plMessage:json_get_value([parameters], TMsg, {struct, []}),
     #postlock_transformation{
         cmd = Cmd,
         oid = Oid,
         parameters = ParamList
     }.
+
+%%--------------------------------------------------------------------
+%% Websocket handling functions
+%%--------------------------------------------------------------------
+connect_websocket(ArgsHeaders, SessionId) ->
+    case get_upgrade_header(ArgsHeaders) of 
+	"WebSocket" ->
+	    WebSocketOwner = spawn_link(?MODULE, websocket_owner, [SessionId, self()]),
+	    {ok, WebSocketOwner};
+    BadHeader ->
+        {error, {bad_header, BadHeader}}
+    end.
+
+websocket_owner(SessionId, SyncServer) ->
+    io:format("starting websocket_owner~n", []),
+    receive
+	{ok, WebSocket} ->
+        self() ! yaws_api:websocket_receive(WebSocket),
+	    listen_loop(WebSocket, SyncServer);
+	BadValue ->
+        {error, BadValue}
+    end.
+
+listen_loop(WebSocket, SyncServer) ->
+    receive
+    {ok, [Message]} -> % used in 'passive mode'
+        gen_fsm:send_event(SyncServer, {client_message,
+            plMessage:parse_raw_message(Message)}),
+        listen_loop(WebSocket, SyncServer);
+	{tcp, WebSocket, DataFrame} -> % used in 'active mode'
+        % Try to decode all JSON messages 
+        % received through the websocket.
+        [gen_fsm:send_event(SyncServer, {client_message, 
+            plMessage:parse_raw_message(erlang:binary_to_list(Msg))
+            }) || Msg <- yaws_websockets:unframe_all(DataFrame, [])],
+        listen_loop(WebSocket, SyncServer);
+    {send, ToBeSent} ->
+        yaws_api:websocket_send(WebSocket, ToBeSent),
+        listen_loop(WebSocket, SyncServer);
+    {set_active_mode} ->
+        yaws_api:websocket_setopts(WebSocket, [{active, true}]),
+        listen_loop(WebSocket, SyncServer);
+	{tcp_closed, WebSocket} ->
+        gen_fsm:send_all_state_event(SyncServer, websocket_closed),
+	    io:format("Websocket closed. Terminating listen_loop...~n"),
+        {error, websocket_disconnect};
+	Any ->
+	    io:format("listen_loop received unexpected msg:~p~n", [Any]),
+        {error, websocket_disconnect}
+    end.
+
+% From YAWS example
+get_upgrade_header(#headers{other=L}) ->
+    lists:foldl(fun({http_header,_,K0,_,V}, undefined) ->
+                        K = case is_atom(K0) of
+                                true ->
+                                    atom_to_list(K0);
+                                false ->
+                                    K0
+                            end,
+                        case string:to_lower(K) of
+                            "upgrade" ->
+                                V;
+                            _ ->
+                                undefined
+                        end;
+                   (_, Acc) ->
+                        Acc
+                end, undefined, L).
 

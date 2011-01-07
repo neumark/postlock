@@ -37,8 +37,9 @@ test("some other test", function() {
   });
 
 var postlock = mkPostlock(document.location.href.slice(7) + "backend.yaws");
-postlock.set_cb('connection_state_change', function(message, oldstate, newstate) {
-    console.log("new telepathy connection state is " + JSON.stringify([message, oldstate, newstate]));
+postlock.set_cb('connection_state_change', function(oldstate, newstate, message) {
+    console.log("State changed: " + oldstate + " -> " + newstate + " message: " +JSON.stringify(message));
+    if (postlock.is_connected())
     try {
         var v = postlock.make_data({value: 1});
         v.set(2);
@@ -50,8 +51,7 @@ postlock.connect();
 </script>
 </head>
 <body>
-<h1>Postlock unit tests</h1>
-<h1 id="qunit-header">QUnit example</h1>
+<h1 id="qunit-header">Postlock unit tests</h1>
 <h2 id="qunit-banner"></h2>
 <div id="qunit-testrunner-toolbar"></div>
 <h2 id="qunit-userAgent"></h2>

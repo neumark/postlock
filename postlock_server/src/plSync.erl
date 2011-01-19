@@ -28,8 +28,8 @@
         initial_copy/2, initial_copy/3,
         connected/2, connected/3,
         % other functions
-        connect_websocket/2,
-        websocket_owner/2,
+        connect_websocket/1,
+        websocket_owner/1,
         % standard gen_fsm exports
         handle_event/3, handle_sync_event/4, handle_info/3, terminate/3,
         code_change/4, init/1]).
@@ -41,6 +41,9 @@
 -record(state, {
           % The id of the client.
           client_id,
+          % The postlock user represented by
+          % the client
+          user_id = "NA", %TODO: update auth-challege/response to set UID
           % low-level websocket data from YAWS
           websocket_data,
           % The PID of the process which owns the websocket, used to
@@ -48,7 +51,9 @@
           websocket_owner,
           % PID of the state server, which we forward transactions to
           % and get updates from
-          state_server
+          state_server,
+          % transaction id counter
+          transaction_id = 0
 }).
 -define(DEFAULT_TIMEOUT, 100000).
 %%====================================================================
@@ -75,10 +80,10 @@ start_link(ServerData) ->
 %% gen_fsm:start_link/3,4, this function is called by the new process to 
 %% initialize. 
 %%--------------------------------------------------------------------
-init([StateServer, ClientId, {websocket, ArgsHeaders, SessionId}]) ->
+init([StateServer, ClientId, {websocket, ArgsHeaders}]) ->
     process_flag(trap_exit, true),
     % Initialize websocket
-    case connect_websocket(ArgsHeaders, SessionId) of
+    case connect_websocket(ArgsHeaders) of
         {ok, WebSocketOwner} ->
             {ok, idle, #state{
                    client_id = ClientId,
@@ -123,7 +128,9 @@ auth({client_message, Msg}, State) when Msg#postlock_message.type == "auth_respo
     OutMsg = plMessage:make_message("client_data", [], 
         {struct, [{"client_id", State#state.client_id}, {"num_objects", NumPublicObjects}]}),
     State#state.websocket_owner ! {send, OutMsg},
-    NewState = do_initial_copy(State),
+    {NewState, _CopiedSet} = do_initial_copy(State),
+    % send ourselves a copy_finished message.
+    gen_fsm:send_event(self(), {copy_finished}),
     {next_state, initial_copy, NewState};
 
 auth(Event, State) ->
@@ -136,15 +143,25 @@ auth(Event, _From, State) ->
 
 %%--------------------------------------------------------------------
 %% state: initial_copy
+%% At this point the transfer of object has already been completed.
+%% We only need to transfer pending transactions, and send a
+%% copy_finished message when done.
 %%--------------------------------------------------------------------
-
-initial_copy({client_message, Msg}, State) when Msg#postlock_message.type == "ack_copy" ->
-    % TODO: STUB
-    State#state.websocket_owner ! {send, plMessage:make_message("transaction")},
+initial_copy({copy_finished}, State) ->
+    State#state.websocket_owner ! {send, plMessage:make_message("copy_finished")},
     {next_state, initial_copy, State};
 
-initial_copy({client_message, Msg}, State) when Msg#postlock_message.type == "ack_transactions" ->
+initial_copy({client_message, Msg}, State) when Msg#postlock_message.type == "ack_copy" ->
     {next_state, connected, State};
+
+initial_copy({client_message, Msg}, State) ->
+    io:format("unpextected message in initial_copy from client: ~p~n", [Msg]),
+    State#state.websocket_owner ! {send, plMessage:make_error("Unexpcted message: Not yet in connected state!")},
+    {next_state, initial_copy, State};
+
+initial_copy({server_message, Msg}, State) ->
+    io:format("TODO: relay server message to client ~p~n", [Msg]),
+    {next_state, inital_copy, State};
 
 initial_copy(Event, State) ->
     io:format("plSync:initial_copy/2 got unexpected event ~p~n", [Event]),
@@ -168,66 +185,66 @@ connected(Event, _From, State) ->
 %%--------------------------------------------------------------------
 %% Function: 
 %% handle_event(Event, StateName, State) -> {next_state, NextStateName, 
-%%						  NextState} |
-%%                                          {next_state, NextStateName, 
-%%					          NextState, Timeout} |
-%%                                          {stop, Reason, NewState}
-%% Description: Whenever a gen_fsm receives an event sent using
-%% gen_fsm:send_all_state_event/2, this function is called to handle
-%% the event.
-%%--------------------------------------------------------------------
-handle_event(_Event, StateName, State) ->
-    {next_state, StateName, State}.
+    %%						  NextState} |
+    %%                                          {next_state, NextStateName, 
+        %%					          NextState, Timeout} |
+        %%                                          {stop, Reason, NewState}
+        %% Description: Whenever a gen_fsm receives an event sent using
+        %% gen_fsm:send_all_state_event/2, this function is called to handle
+        %% the event.
+        %%--------------------------------------------------------------------
+        handle_event(_Event, StateName, State) ->
+{next_state, StateName, State}.
 
 %%--------------------------------------------------------------------
 %% Function: 
 %% handle_sync_event(Event, From, StateName, 
-%%                   State) -> {next_state, NextStateName, NextState} |
+        %%                   State) -> {next_state, NextStateName, NextState} |
 %%                             {next_state, NextStateName, NextState, 
-%%                              Timeout} |
-%%                             {reply, Reply, NextStateName, NextState}|
-%%                             {reply, Reply, NextStateName, NextState, 
-%%                              Timeout} |
-%%                             {stop, Reason, NewState} |
-%%                             {stop, Reason, Reply, NewState}
-%% Description: Whenever a gen_fsm receives an event sent using
-%% gen_fsm:sync_send_all_state_event/2,3, this function is called to handle
-%% the event.
-%%--------------------------------------------------------------------
-handle_sync_event(_Event, _From, StateName, State) ->
-    Reply = ok,
-    {reply, Reply, StateName, State}.
+    %%                              Timeout} |
+    %%                             {reply, Reply, NextStateName, NextState}|
+    %%                             {reply, Reply, NextStateName, NextState, 
+        %%                              Timeout} |
+        %%                             {stop, Reason, NewState} |
+        %%                             {stop, Reason, Reply, NewState}
+        %% Description: Whenever a gen_fsm receives an event sent using
+        %% gen_fsm:sync_send_all_state_event/2,3, this function is called to handle
+        %% the event.
+        %%--------------------------------------------------------------------
+        handle_sync_event(_Event, _From, StateName, State) ->
+        Reply = ok,
+{reply, Reply, StateName, State}.
 
 %%--------------------------------------------------------------------
 %% Function: 
 %% handle_info(Info,StateName,State)-> {next_state, NextStateName, NextState}|
 %%                                     {next_state, NextStateName, NextState, 
-%%                                       Timeout} |
-%%                                     {stop, Reason, NewState}
-%% Description: This function is called by a gen_fsm when it receives any
-%% other message than a synchronous or asynchronous event
-%% (or a system message).
-%%--------------------------------------------------------------------
-handle_info(_Info, StateName, State) ->
-    {next_state, StateName, State}.
+    %%                                       Timeout} |
+    %%                                     {stop, Reason, NewState}
+    %% Description: This function is called by a gen_fsm when it receives any
+    %% other message than a synchronous or asynchronous event
+    %% (or a system message).
+    %%--------------------------------------------------------------------
+    handle_info(_Info, StateName, State) ->
+{next_state, StateName, State}.
 
-%%--------------------------------------------------------------------
+    %%--------------------------------------------------------------------
 %% Function: terminate(Reason, StateName, State) -> void()
-%% Description:This function is called by a gen_fsm when it is about
-%% to terminate. It should be the opposite of Module:init/1 and do any
-%% necessary cleaning up. When it returns, the gen_fsm terminates with
-%% Reason. The return value is ignored.
-%%--------------------------------------------------------------------
-terminate(_Reason, _StateName, _State) ->
+    %% Description:This function is called by a gen_fsm when it is about
+    %% to terminate. It should be the opposite of Module:init/1 and do any
+    %% necessary cleaning up. When it returns, the gen_fsm terminates with
+    %% Reason. The return value is ignored.
+    %%--------------------------------------------------------------------
+    terminate(_Reason, _StateName, _State) ->
     ok.
 
-%%--------------------------------------------------------------------
-%% Function:
-%% code_change(OldVsn, StateName, State, Extra) -> {ok, StateName, NewState}
-%% Description: Convert process state when code is changed
-%%--------------------------------------------------------------------
-code_change(_OldVsn, StateName, State, _Extra) ->
-    {ok, StateName, State}.
+    %%--------------------------------------------------------------------
+    %% Function:
+    %% code_change(OldVsn, StateName, State, Extra) -> {ok, StateName, NewState}
+    %% Description: Convert process state when code is changed
+    %%--------------------------------------------------------------------
+    code_change(_OldVsn, StateName, State, _Extra) ->
+{ok, StateName, State}.
 
 %%--------------------------------------------------------------------
 %% Internal functions
@@ -244,10 +261,70 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %% will get an inconsistent version of the global state.
 %% Some of the transactions which occurred during do_initial_copy must
 %% be run by the client later on.
+%% We copy leaf nodes (objects of type data) first. Once all the
+%% children of a list/dict are copied, we can copy the list also.
+%% Note that objects can belong to several parents, so a naive
+%% implementation could potentially be susceptible to infinite loops.
 %%--------------------------------------------------------------------
 do_initial_copy(State) ->
-    % STUB -- do nothing for now.
-    State.
+    do_initial_copy_1(
+        [gen_server:call(State#state.state_server, {get_object, "0.0"})], 
+        gb_trees:empty(), 
+        State).
+
+do_initial_copy_1([], CopiedSet, State) ->
+    {State, CopiedSet};
+do_initial_copy_1(AwaitingCopy = [NextObject|Rest], CopiedSet, State) ->
+    case can_send_object(NextObject, CopiedSet, State#state.state_server) of
+        already_sent ->
+            do_initial_copy_1(Rest, CopiedSet, State);
+        can_send ->
+            NewState = send_object(NextObject, State),
+            NewSet = gb_trees:enter(plObject:get_oid(NextObject), NextObject, CopiedSet),
+            do_initial_copy_1(Rest, NewSet, NewState);
+        Prerequisites ->
+            % Add the prerequisites to the front of the queue.
+            NewQueue = lists:foldl(fun(X,L) -> [X|L] end, AwaitingCopy, Prerequisites),
+            do_initial_copy_1(NewQueue, CopiedSet, State)
+    end.
+
+send_object(Obj, State) ->
+    % TODO Maybe I'll be smarter about this and not send
+    % every object in its own transaction, but its 
+    % quick and dirty time now! :)
+    Tid = State#state.transaction_id,
+    NewState = State#state{transaction_id = Tid + 1},
+    Transformation = plObject:make_create_transformation(Obj),
+    Transaction = lists:foldl(
+        fun({Fun,Value},T) -> erlang:apply(plMessage,Fun,[Value,T]) end,
+        % start with an empty transaction
+        plMessage:transaction_new(),
+        % apply the following list of commands
+        [
+            {transaction_set_id, Tid}, 
+            {transaction_set_user, State#state.user_id}, 
+            {transaction_set_client, State#state.client_id}, 
+            {transaction_add_transformation, Transformation} 
+        ]),
+    % send Transaction to client
+    State#state.websocket_owner ! {send, 
+        plMessage:transaction_serialize(Transaction)},
+    NewState.
+
+can_send_object(Object, CopiedSet, StateServer) ->
+    case gb_trees:is_defined(plObject:get_oid(Object), CopiedSet) of
+        true ->
+            already_sent;
+        false ->
+            Children = plObject:get_children(Object, StateServer),
+            Uncopied = lists:filter(
+                fun(Child) -> gb_trees:is_defined(Child, CopiedSet) end,
+                Children),
+            case Uncopied of 
+                [] -> can_send;
+                List -> List
+            end
+    end.
 
 %%--------------------------------------------------------------------
 %% Function: 
@@ -258,49 +335,48 @@ do_initial_copy(State) ->
 %% Only transformations not yet applied to the copied object are
 %% forwarded.
 %%--------------------------------------------------------------------
-process_pending_transformation(_Transformation, State) ->
-    % STUB -- do nothing for now.
-    State.
+%process_pending_transformation(_Transformation, State) ->
+%    % STUB -- do nothing for now.
+%    State.
    
 %%--------------------------------------------------------------------
 %% Input message parsing functions
 %%--------------------------------------------------------------------
-json_to_transaction(JsonMessage) ->
-    try
-        {ok, Id} = plMessage:json_get_value([header, id], JsonMessage),
-        {_, AckList} = plMessage:json_get_value([body, response, ack], JsonMessage, []),
-        {ok, {array, Tlist}} = plMessage:json_get_value([body, transformations], JsonMessage),
-        {ok, #postlock_transaction{
-            id=Id,
-            ack = AckList,
-            transformations = lists:map(fun interpret_transformation/1, Tlist)
-        }}
-    catch
-        _:_ -> {error, ["failed to parse transaction", JsonMessage]}
-    end.
-interpret_transformation(TMsg) ->
-    {ok, Cmd} = plMessage:json_get_value([command], TMsg),
-    {_, Oid} = plMessage:json_get_value([parameters, oid], TMsg, none),
-    {_, {struct, ParamList}} = plMessage:json_get_value([parameters], TMsg, {struct, []}),
-    #postlock_transformation{
-        cmd = Cmd,
-        oid = Oid,
-        parameters = ParamList
-    }.
+%
+%json_to_transaction(JsonMessage) ->
+%    try
+%        {ok, Id} = plMessage:json_get_value([header, id], JsonMessage),
+%        {_, AckList} = plMessage:json_get_value([body, response, ack], JsonMessage, []),
+%        {ok, {array, Tlist}} = plMessage:json_get_value([body, transformations], JsonMessage),
+%        {ok, #postlock_transaction{
+%            id=Id,
+%            transformations = lists:map(fun interpret_transformation/1, Tlist)
+%        }}
+%    catch
+%        _:_ -> {error, ["failed to parse transaction", JsonMessage]}
+%    end.
 
-%%--------------------------------------------------------------------
-%% Websocket handling functions
-%%--------------------------------------------------------------------
-connect_websocket(ArgsHeaders, SessionId) ->
+%interpret_transformation(TMsg) ->
+%    {ok, Cmd} = plMessage:json_get_value([command], TMsg),
+%    {_, Oid} = plMessage:json_get_value([parameters, oid], TMsg, none),
+%    {_, {struct, ParamList}} = plMessage:json_get_value([parameters], TMsg, {struct, []}),
+%    #postlock_transformation{
+%        cmd = Cmd,
+%        oid = Oid,
+%        parameters = ParamList
+%    }.
+
+%% == Websocket handling functions ==
+connect_websocket(ArgsHeaders) ->
     case get_upgrade_header(ArgsHeaders) of 
 	"WebSocket" ->
-	    WebSocketOwner = spawn_link(?MODULE, websocket_owner, [SessionId, self()]),
+	    WebSocketOwner = spawn_link(?MODULE, websocket_owner, [self()]),
 	    {ok, WebSocketOwner};
     BadHeader ->
         {error, {bad_header, BadHeader}}
     end.
 
-websocket_owner(SessionId, SyncServer) ->
+websocket_owner(SyncServer) ->
     io:format("starting websocket_owner~n", []),
     receive
 	{ok, WebSocket} ->

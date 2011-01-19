@@ -36,7 +36,6 @@ var mkPostlock = function (websocket_url) {
                 },
                 get: function(tid) {return my[tid.charAt(0)][tid];},
                 remove: function(tid) {
-                    console.log("deleteing " + tid);
                     delete my[tid.charAt(0)][tid];
                 },
                 list_acked_remote: function() {
@@ -344,10 +343,13 @@ var mkPostlock = function (websocket_url) {
         };
         my.fun.apply = function () {
             // add id to local transactions
-            if (!my.msg.header.id) PL.util.add_message_id(my.msg.header);
+            if (my.msg.header.id === undefined) PL.util.add_message_id(my.msg.header);
             PL.transactions.save(my.ret);
             if (my.fun.apply_locally()) {
-                if (my.is_remote) my.current_status = "acknowledged";
+                if (my.is_remote) {
+                    my.current_status = "acknowledged";
+                    PL.transactions.remove(my.fun.get_tid());
+                }
                 else my.fun.send();
                 return true;
             }
@@ -361,7 +363,7 @@ var mkPostlock = function (websocket_url) {
             }
             my.current_status = "acknowledged";
             // unregister transaction
-            delete PL.transactions.remove(my.fun.get_tid());
+            PL.transactions.remove(my.fun.get_tid());
         };
         // RETURN EXPORTS
         my.ret = {
@@ -779,18 +781,18 @@ var mkPostlock = function (websocket_url) {
                     },
                     initial_copy: function (msg_obj) {
                         switch (msg_obj.type) {
-                            case "state_data": 
-                                if (msg_object.header !== undefined && msg_object.header.last === true) {
-                                    my.fun.websocket_safe_send(PL.util.create_message("ack_copy"));
-                                }
+                            case "copy_finished":
+                                my.fun.websocket_safe_send(PL.util.create_message("ack_copy"));
+                                PL.util.is_connected = function() {return true;};
+                                my.fun.connection_state_change(msg_obj, 'connected');
                                 break;
-                            case "pending_transaction":
-                                if (msg_object.header !== undefined && msg_object.header.last === true) {
-                                    my.fun.connection_state_change(msg_obj, 'connected');
-                                    my.fun.websocket_safe_send(PL.util.create_message("ack_transactions"));
-                                }
+                            case "transaction": 
+                                (function() {
+                                    var T = PL.modules.mkTransaction({msg: msg_obj, is_remote: true});
+                                    T.apply();
+                                })();
                                 break;
-                            default:
+                           default:
                                 return false;
                         };
                         return true;
@@ -844,7 +846,7 @@ var mkPostlock = function (websocket_url) {
         
         PL.outqueue.add_transaction = function (transaction_msg) {
             transaction_msg.ts.queued = PL.util.get_timestamp();
-            transaction_msg.body.response = {
+            transaction_msg.header.results = {
                 ack: PL.util.prepare_acks_of_remote_transactions()
             };
             PL.outqueue.push(transaction_msg);

@@ -39,12 +39,15 @@ test("some other test", function() {
 var postlock = mkPostlock(document.location.href.slice(7) + "backend.yaws");
 postlock.set_cb('connection_state_change', function(oldstate, newstate, message) {
     console.log("State changed: " + oldstate + " -> " + newstate + " message: " +JSON.stringify(message));
-    if (postlock.is_connected())
-    try {
-        var v = postlock.make_data({value: 1});
-        v.set(2);
-    } catch (e) {
-        console.log(e.stack);
+    if (postlock.is_connected()) {
+        console.log("Postlock has connected!");
+        try {
+            var v = postlock.make_data({value: 1});
+            console.dir(v);
+        //  v.set(2);
+        } catch (e) {
+            console.log(e.stack);
+        }
     }
 });
 postlock.connect();

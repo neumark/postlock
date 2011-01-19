@@ -14,40 +14,51 @@
 %%% stored.
 %%% ----------------------------------------------------------
 -record(postlock_object, {
-    id,                     % {clientid, objectid} (key)
-    type,                   % data | dict | list
-    contents,               % opaque, content depends upon
-                            % the type of object
-    parents = []            % a list of ids who are parents of
-                            % this node.
+    oid,                     % OID (key)
+    content,                % opaque, content depends upon
+                            % determines type
+    last_transformation,    % The last transformation committed on 
+                            % the object
+    permissions             % not used yet
 }).
+
+%%% ----------------------------------------------------------
+%%% Various postlock object types: 
+%%% ----------------------------------------------------------
+-record(postlock_content_dict, {
+    children = gb_trees:empty() % contains a gb_tree
+}).
+-record(postlock_content_data, {
+    data                    % contains a string (list)
+}).
+-record(postlock_content_list, {
+    children = []           % contains a list of OIDs
+}).
+
+
+
 
 %%% ----------------------------------------------------------
 %%% postlock_transformation - the list of all transformations
 %%% which have been committed on the shared state
 %%% ----------------------------------------------------------
--record(postlock_transformation, {
-    id,                     % integer (key)
-    client,                 % id of user who submitted t
-    cmd,                    % command of transformation
-    oid,                    % may be undefined for 'create'
-    parameters,             % parameters to the command
-    extra_data              % optional extra data
+-record(postlock_transaction, {
+    id,                     % transaction id integer (key)
+    client,
+    user,
+    meta                    % stuff like timestamps
 }).
 
-%%% ----------------------------------------------------------
-%%% postlock_transaction - contains a group of transformations
-%%% received by the sync server from a client.
-%%% ----------------------------------------------------------
--record(postlock_transaction, {
+-record(postlock_transformation, {
     id,                     % integer (key)
-    client,                 % id of user who submitted t
-    ack = [],               % a list of ACKs sent by the client
-                            % or server
-    nack = [],              % a list of NACKs sent by the server
-    transformations = [],   % list of transformations
-    received = now()        % timestamp of transaction
+    transaction_id,         % id of transaction which this
+                            % transformation belongs to
+    oid,                    % 
+    cmd,                    % command of transformation
+    parameters,             % parameters to the command
+    undo_data               % data needed to undo transformation
 }).
+
 
 %%% ----------------------------------------------------------
 %%% ----------------------------------------------------------

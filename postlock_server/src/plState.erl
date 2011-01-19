@@ -76,6 +76,10 @@ handle_call({get_num_public_objects}, _From, State) ->
     Reply = 0,
     {reply, Reply, State};
 
+handle_call({get_object, Oid}, _From, State) ->
+    % STUB
+    {reply, get_object(State#state.sessionid, Oid), State};
+
 handle_call(Request, _From, State) ->
     io:format("plState:handle_call got ~p~n",[Request]),
     Reply = ok,
@@ -139,9 +143,16 @@ make_session_tables(SessionId) ->
 create_root_node(SessionId) ->
     {ObjTable, _} = sessionid_to_tablenames(SessionId),
     Root = #postlock_object{
-        id={SessionId, 0,0},
-        type=dict
+        oid="0.0",
+        content=#postlock_content_dict{}
     },
     mnesia:transaction(fun() -> mnesia:write(ObjTable, Root, write) end),
     error_logger:info_report(["Root node created for session", SessionId]).
 
+get_object(SessionId, Oid) ->
+    {ObjTable, _} = sessionid_to_tablenames(SessionId),
+    {atomic, ObjData} = mnesia:transaction(fun() -> mnesia:read(ObjTable, Oid, read) end),
+    case ObjData of
+        [] ->  undefined;
+        [Obj] -> Obj
+    end.

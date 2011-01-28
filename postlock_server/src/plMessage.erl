@@ -7,7 +7,9 @@
 %%%-------------------------------------------------------------------
 -module(plMessage).
 -export([parse_raw_message/1,
+         parse_transformations/1,
          make_error/1,
+         make_error/2,
          make_message/1,
          make_message/3,
          transaction_new/0,
@@ -40,11 +42,16 @@
     created  = now()        % timestamp of transaction
 }).
 
-make_error(Reason) ->
+make_error(Err) ->
+    make_error(Err, json:obj_new()).
+
+make_error({Code, Msg}, Extra) ->
     make_message(
         "error",
         [],
-        {struct, [{"reason", Reason}]}
+        json:obj_store("code", Code,
+            json:obj_store("message", Msg,
+                Extra))
     ).
 
 make_message(Type) ->
@@ -71,6 +78,24 @@ parse_raw_message(Msg) ->
             body=Body
         }
     catch error:{badmatch, _} -> {bad_message, Msg}
+    end.
+
+%% @doc Create a #postlock_transaction and #postlock_transformations fom
+%% JSON transaction message.
+parse_transformations(Json) ->
+     try
+        {ok, {array, TList}} = json_get_value([transformations],Json),
+        {ok, [ begin
+            {ok, Oid} = json_get_value([oid], T),
+            {ok, Cmd} = json_get_value([command], T),
+            {ok, Parameters} = json_get_value([parameters], T),
+            #postlock_transformation{
+                oid=Oid,
+                cmd=Cmd,
+                parameters=Parameters}
+          end  
+          || T <- TList]}
+    catch error:{badmatch, Reason} -> {bad_message, [Reason, Json]}
     end.
 
 json_get_value(KeyList, JsonMessage) ->

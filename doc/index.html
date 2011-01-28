@@ -1,0 +1,50 @@
+<!DOCTYPE html> 
+<html> 
+<head> 
+    <meta charset="utf-8" /> 
+    <title>IS-MGW M3UA documentation</title> 
+    <link rel="stylesheet" type="text/css" href="js/jquery-tooltip/jquery.tooltip.css" />
+    <link rel="stylesheet" type="text/css" href="js/jquery-tooltip/demo/screen.css" />
+    <link rel="stylesheet" type="text/css" href="js/ui/css/smoothness/jquery-ui-1.8.7.custom.css" />      
+    <link rel="stylesheet" type="text/css" href="js/sas.css" />      
+    <script type='text/javascript' src='console.js'></script> 
+    <script type='text/javascript' src='jquery-1.4.4.js'></script> 
+    <script type='text/javascript' src='ui/js/jquery-ui-1.8.7.custom.min.js'></script>
+    <script type='text/javascript' src='raphael-min.js'></script> 
+    <script type='text/javascript' src='read_svg.js'></script> 
+    <script type='text/javascript' src='zoom.js'></script> 
+    <script type='text/javascript' src='jquery-tooltip/jquery.tooltip.js'></script>
+    <script type='text/javascript' src='sas.js'></script> 
+    <script type="text/javascript"> 
+    jQuery(document).ready(function(){
+        // Load and zoom m3ua.svg
+        var paper1 = Raphael("paper1", 1200, 700);
+        sas(paper1, "m3ua.xml", function() {
+            zoom(26, paper1);
+        });
+        // Load blades.svg
+        var paper2 = Raphael("paper2", 1200, 800);
+        sas(paper2, "blades.xml", function() {
+            zoom(1.3, paper2);
+        });
+    });
+    </script> 
+    <style type="text/css">  
+            #canvas_container {  
+                width: 800px;
+                border: 1px solid #aaa;  
+            }  
+            #content {display:none;}
+    </style>  
+</head> 
+<body> 
+<h1>Protokoll diagram</h1>
+This diagram details the protocols used by the various components to deliver the M3UA functionality.
+<div id="paper1"></div> 
+<h1>Process distribution</h1>
+This diagram documents which processes run on which blade and how these processes communicate with each other.
+<div id="paper2"></div> 
+<div id="content">
+</div> <!-- end of #content div -->
+</body> 
+</html> 

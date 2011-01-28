@@ -346,10 +346,7 @@ var mkPostlock = function (websocket_url) {
             if (my.msg.header.id === undefined) PL.util.add_message_id(my.msg.header);
             PL.transactions.save(my.ret);
             if (my.fun.apply_locally()) {
-                if (my.is_remote) {
-                    my.current_status = "acknowledged";
-                    PL.transactions.remove(my.fun.get_tid());
-                }
+                if (my.is_remote) my.current_status = "acknowledged";
                 else my.fun.send();
                 return true;
             }
@@ -805,6 +802,13 @@ var mkPostlock = function (websocket_url) {
         };          // end my
         my.fun.handle_incoming_msg.current = my.fun.handle_incoming_msg.idle;
 
+        // default error handler function, override this!
+        my.cb.set_user_cb("error", function() {
+            var i;
+            console.log(PL.util.get_timestamp() + " - error: " + (arguments[0] || "") + " " + arguments.length + " arguments:");
+            for (i = 0; i < arguments.length; i++) console.dir(arguments[i]);
+        });
+
         // handle incoming message from server
         my.cb.set_internal_cb("ws_onopen", function () {
             my.fun.websocket_safe_send(PL.util.create_message("client_connect"));
@@ -817,7 +821,7 @@ var mkPostlock = function (websocket_url) {
             try {
                 t = JSON.parse(msg.data);
             } catch (e) {
-                console.error("parse error: " + e.message + " input: " + msg.data);
+                my.cb.fire("error", ["parsing", e, msg]);
             }
             // apply server transformation
             if (t !== null)  {
@@ -825,9 +829,12 @@ var mkPostlock = function (websocket_url) {
                     ret = my.fun.handle_incoming_msg.current(t);
                 } catch (e) {
                     // TODO: maybe fire a callback...
-                    console.error("error handling incoming message " + e.message, e);
+                    my.cb.fire("error",["message_processing", e]);
                 }
-                if (!ret) console.error("unexpected message for state " + my.state + ", received " + JSON.stringify(t));
+                if (!ret) {
+                    if (t.type === "error") my.cb.fire("error", ["remote_error", t]);
+                    else my.cb.fire("error", ["unexpected_message", my.state, t]);
+                }
             }
             else console.log("failed to parse incoming message '" + msg.data +"'");
         });

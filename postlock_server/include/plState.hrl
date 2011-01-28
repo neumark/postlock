@@ -44,8 +44,8 @@
 %%% ----------------------------------------------------------
 -record(postlock_transaction, {
     id,                     % transaction id integer (key)
-    client,
-    user,
+    client_id,
+    user_id,
     meta                    % stuff like timestamps
 }).
 

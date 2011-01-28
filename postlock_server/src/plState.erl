@@ -65,12 +65,6 @@ init([SessionId, CallbackServer]) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call({run_transaction, _T}, _From, State) ->
-    % STUB
-    %_CbReply = gen_server:call(State#state.callback, Req),
-    Reply = ok,
-    {reply, Reply, State};
-
 handle_call({get_num_public_objects}, _From, State) ->
     % STUB
     Reply = 0,
@@ -91,7 +85,12 @@ handle_call(Request, _From, State) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
-handle_cast(_Msg, State) ->
+handle_cast({client_transaction, T}, State) ->
+    io:format("plState received transaction ~p~n",[T]),
+    {noreply, State};
+
+handle_cast(Msg, State) ->
+    io:format("plState:handle_cast got ~p~n",[Msg]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------

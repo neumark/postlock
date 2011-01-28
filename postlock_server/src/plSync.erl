@@ -36,6 +36,7 @@
 
 -include("plState.hrl").
 -include("plMessage.hrl").
+-include("plError.hrl").
 -include("yaws_api.hrl").
 
 -record(state, {
@@ -156,7 +157,7 @@ initial_copy({client_message, Msg}, State) when Msg#postlock_message.type == "ac
 
 initial_copy({client_message, Msg}, State) ->
     io:format("unpextected message in initial_copy from client: ~p~n", [Msg]),
-    State#state.websocket_owner ! {send, plMessage:make_error("Unexpcted message: Not yet in connected state!")},
+    State#state.websocket_owner ! {send, plMessage:make_error(?BAD_SYNC_STATE_FOR_CLIENT_MESSAGE)},
     {next_state, initial_copy, State};
 
 initial_copy({server_message, Msg}, State) ->
@@ -174,6 +175,35 @@ initial_copy(Event, _From, State) ->
 %%--------------------------------------------------------------------
 %% state: connected
 %%--------------------------------------------------------------------
+connected({client_message, Msg}, State) when Msg#postlock_message.type == "transaction" ->
+    T = 
+    try
+        {ok, Transformations} = plMessage:parse_transformations(Msg#postlock_message.body),
+        % TODO: check that TID is the next expected TID from client!
+        {ok, Tid} = plMessage:json_get_value([id], Msg#postlock_message.header),
+        Transaction = #postlock_transaction{
+            id=Tid,
+            client_id=State#state.client_id,
+            user_id=State#state.user_id
+        },
+        {ok, {Transaction, Transformations}}
+    catch error:{badmatch, Reason} -> 
+        {error, ["Error parsing transaction", State, Msg, Reason]}
+    end,
+    case T of
+        {ok, Tdata} ->
+            gen_server:cast(State#state.state_server, {client_transaction, Tdata});
+        {error, E} ->
+            error_logger:info_report(E),
+            State#state.websocket_owner ! {send, 
+                plMessage:make_error(?ERROR_PARSING_TRANSACTION, 
+                json:obj_store(
+                    "transaction_header",
+                    Msg#postlock_message.header,
+                    json:obj_new()))}
+    end,
+    {next_state, connected, State};
+
 connected(Event, State) ->
     io:format("plSync:connected/2 got unexpected event ~p~n", [Event]),
     {next_state, connected, State}.
@@ -185,66 +215,66 @@ connected(Event, _From, State) ->
 %%--------------------------------------------------------------------
 %% Function: 
 %% handle_event(Event, StateName, State) -> {next_state, NextStateName, 
-    %%						  NextState} |
-    %%                                          {next_state, NextStateName, 
-        %%					          NextState, Timeout} |
-        %%                                          {stop, Reason, NewState}
-        %% Description: Whenever a gen_fsm receives an event sent using
-        %% gen_fsm:send_all_state_event/2, this function is called to handle
-        %% the event.
-        %%--------------------------------------------------------------------
-        handle_event(_Event, StateName, State) ->
-{next_state, StateName, State}.
+%%						  NextState} |
+%%                                          {next_state, NextStateName, 
+%%					          NextState, Timeout} |
+%%                                          {stop, Reason, NewState}
+%% Description: Whenever a gen_fsm receives an event sent using
+%% gen_fsm:send_all_state_event/2, this function is called to handle
+%% the event.
+%%--------------------------------------------------------------------
+handle_event(_Event, StateName, State) ->
+    {next_state, StateName, State}.
 
 %%--------------------------------------------------------------------
 %% Function: 
 %% handle_sync_event(Event, From, StateName, 
-        %%                   State) -> {next_state, NextStateName, NextState} |
+%%                   State) -> {next_state, NextStateName, NextState} |
 %%                             {next_state, NextStateName, NextState, 
-    %%                              Timeout} |
-    %%                             {reply, Reply, NextStateName, NextState}|
-    %%                             {reply, Reply, NextStateName, NextState, 
-        %%                              Timeout} |
-        %%                             {stop, Reason, NewState} |
-        %%                             {stop, Reason, Reply, NewState}
-        %% Description: Whenever a gen_fsm receives an event sent using
-        %% gen_fsm:sync_send_all_state_event/2,3, this function is called to handle
-        %% the event.
-        %%--------------------------------------------------------------------
-        handle_sync_event(_Event, _From, StateName, State) ->
-        Reply = ok,
-{reply, Reply, StateName, State}.
+%%                              Timeout} |
+%%                             {reply, Reply, NextStateName, NextState}|
+%%                             {reply, Reply, NextStateName, NextState, 
+%%                              Timeout} |
+%%                             {stop, Reason, NewState} |
+%%                             {stop, Reason, Reply, NewState}
+%% Description: Whenever a gen_fsm receives an event sent using
+%% gen_fsm:sync_send_all_state_event/2,3, this function is called to handle
+%% the event.
+%%--------------------------------------------------------------------
+handle_sync_event(_Event, _From, StateName, State) ->
+    Reply = ok,
+    {reply, Reply, StateName, State}.
 
 %%--------------------------------------------------------------------
 %% Function: 
 %% handle_info(Info,StateName,State)-> {next_state, NextStateName, NextState}|
 %%                                     {next_state, NextStateName, NextState, 
-    %%                                       Timeout} |
-    %%                                     {stop, Reason, NewState}
-    %% Description: This function is called by a gen_fsm when it receives any
-    %% other message than a synchronous or asynchronous event
-    %% (or a system message).
-    %%--------------------------------------------------------------------
-    handle_info(_Info, StateName, State) ->
-{next_state, StateName, State}.
+%%                                       Timeout} |
+%%                                     {stop, Reason, NewState}
+%% Description: This function is called by a gen_fsm when it receives any
+%% other message than a synchronous or asynchronous event
+%% (or a system message).
+%%--------------------------------------------------------------------
+handle_info(_Info, StateName, State) ->
+    {next_state, StateName, State}.
 
-    %%--------------------------------------------------------------------
+%%--------------------------------------------------------------------
 %% Function: terminate(Reason, StateName, State) -> void()
-    %% Description:This function is called by a gen_fsm when it is about
-    %% to terminate. It should be the opposite of Module:init/1 and do any
-    %% necessary cleaning up. When it returns, the gen_fsm terminates with
-    %% Reason. The return value is ignored.
-    %%--------------------------------------------------------------------
-    terminate(_Reason, _StateName, _State) ->
+%% Description:This function is called by a gen_fsm when it is about
+%% to terminate. It should be the opposite of Module:init/1 and do any
+%% necessary cleaning up. When it returns, the gen_fsm terminates with
+%% Reason. The return value is ignored.
+%%--------------------------------------------------------------------
+terminate(_Reason, _StateName, _State) ->
     ok.
 
-    %%--------------------------------------------------------------------
-    %% Function:
-    %% code_change(OldVsn, StateName, State, Extra) -> {ok, StateName, NewState}
-    %% Description: Convert process state when code is changed
-    %%--------------------------------------------------------------------
-    code_change(_OldVsn, StateName, State, _Extra) ->
-{ok, StateName, State}.
+%%--------------------------------------------------------------------
+%% Function:
+%% code_change(OldVsn, StateName, State, Extra) -> {ok, StateName, NewState}
+%% Description: Convert process state when code is changed
+%%--------------------------------------------------------------------
+code_change(_OldVsn, StateName, State, _Extra) ->
+    {ok, StateName, State}.
 
 %%--------------------------------------------------------------------
 %% Internal functions

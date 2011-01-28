@@ -1,0 +1,3 @@
+[submodule "doc/sas"]
+	path = doc/sas
+	url = git@github.com:neumark/sas.git

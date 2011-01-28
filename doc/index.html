@@ -2,30 +2,25 @@
 <html> 
 <head> 
     <meta charset="utf-8" /> 
-    <title>IS-MGW M3UA documentation</title> 
-    <link rel="stylesheet" type="text/css" href="js/jquery-tooltip/jquery.tooltip.css" />
-    <link rel="stylesheet" type="text/css" href="js/jquery-tooltip/demo/screen.css" />
-    <link rel="stylesheet" type="text/css" href="js/ui/css/smoothness/jquery-ui-1.8.7.custom.css" />      
-    <link rel="stylesheet" type="text/css" href="js/sas.css" />      
-    <script type='text/javascript' src='console.js'></script> 
-    <script type='text/javascript' src='jquery-1.4.4.js'></script> 
-    <script type='text/javascript' src='ui/js/jquery-ui-1.8.7.custom.min.js'></script>
-    <script type='text/javascript' src='raphael-min.js'></script> 
-    <script type='text/javascript' src='read_svg.js'></script> 
-    <script type='text/javascript' src='zoom.js'></script> 
-    <script type='text/javascript' src='jquery-tooltip/jquery.tooltip.js'></script>
-    <script type='text/javascript' src='sas.js'></script> 
+    <title>Postlock Documentation</title> 
+    <link rel="stylesheet" type="text/css" href="sas/src/jquery-tooltip/jquery.tooltip.css" />
+    <link rel="stylesheet" type="text/css" href="sas/src/ui/css/smoothness/jquery-ui-1.8.7.custom.css" />      
+    <link rel="stylesheet" type="text/css" href="sas/src/sas.css" />      
+    <link rel="stylesheet" type="text/css" href="postlock_documentation.css" />      
+    <script type='text/javascript' src='sas/src/console.js'></script> 
+    <script type='text/javascript' src='sas/src/ui/js/jquery-1.4.4.min.js'></script> 
+    <script type='text/javascript' src='sas/src/ui/js/jquery-ui-1.8.7.custom.min.js'></script>
+    <script type='text/javascript' src='sas/src/raphael-min.js'></script> 
+    <script type='text/javascript' src='sas/src/read_svg.js'></script> 
+    <script type='text/javascript' src='sas/src/zoom.js'></script> 
+    <script type='text/javascript' src='sas/src/jquery-tooltip/jquery.tooltip.js'></script>
+    <script type='text/javascript' src='sas/src/sas.js'></script> 
     <script type="text/javascript"> 
     jQuery(document).ready(function(){
         // Load and zoom m3ua.svg
         var paper1 = Raphael("paper1", 1200, 700);
-        sas(paper1, "m3ua.xml", function() {
-            zoom(26, paper1);
-        });
-        // Load blades.svg
-        var paper2 = Raphael("paper2", 1200, 800);
-        sas(paper2, "blades.xml", function() {
-            zoom(1.3, paper2);
+        sas(paper1, "client-gateway-protocol.svg", function() {
+            //zoom(26, paper1);
         });
     });
     </script> 
@@ -46,5 +41,9 @@ This diagram documents which processes run on which blade and how these processe
 <div id="paper2"></div> 
 <div id="content">
 </div> <!-- end of #content div -->
+    <div id="idle_state">
+        <div class="tooltip">State <em>idle</em><table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table></div>
+        <div class="content">Asdf</div>
+    </div> <!-- end idle_state -->
 </body> 
 </html> 

@@ -3,47 +3,38 @@
 <head> 
     <meta charset="utf-8" /> 
     <title>Postlock Documentation</title> 
-    <link rel="stylesheet" type="text/css" href="sas/src/jquery-tooltip/jquery.tooltip.css" />
-    <link rel="stylesheet" type="text/css" href="sas/src/ui/css/smoothness/jquery-ui-1.8.7.custom.css" />      
-    <link rel="stylesheet" type="text/css" href="sas/src/sas.css" />      
-    <link rel="stylesheet" type="text/css" href="postlock_documentation.css" />      
-    <script type='text/javascript' src='sas/src/console.js'></script> 
-    <script type='text/javascript' src='sas/src/ui/js/jquery-1.4.4.min.js'></script> 
-    <script type='text/javascript' src='sas/src/ui/js/jquery-ui-1.8.7.custom.min.js'></script>
-    <script type='text/javascript' src='sas/src/raphael-min.js'></script> 
-    <script type='text/javascript' src='sas/src/read_svg.js'></script> 
-    <script type='text/javascript' src='sas/src/zoom.js'></script> 
-    <script type='text/javascript' src='sas/src/jquery-tooltip/jquery.tooltip.js'></script>
-    <script type='text/javascript' src='sas/src/sas.js'></script> 
+    <link rel="stylesheet" type="text/css" href="sas/lib/jquery-tooltip/jquery.tooltip.css" />
+    <link rel="stylesheet" type="text/css" href="sas/lib/ui/css/smoothness/jquery-ui-1.8.7.custom.css" />      
+    <link rel="stylesheet" type="text/css" href="sas/css/sas.css" />      
+    <script type='text/javascript' src='sas/lib/jquery-1.5.js'></script> 
+    <script type='text/javascript' src='sas/lib/javascript-debug/ba-debug.js'></script> 
+    <script type='text/javascript' src='sas/lib/jquery-bbq/jquery.ba-bbq.js'></script> 
+    <script type='text/javascript' src='sas/lib/ui/js/jquery-ui-1.8.7.custom.min.js'></script>
+    <script type='text/javascript' src='sas/lib/jquery-tooltip/jquery.tooltip.js'></script>
+    <script type='text/javascript' src='sas/lib/raphael-min.js'></script> 
+    <script type='text/javascript' src='sas/lib/raphael-matrix.js'></script> 
+    <script type='text/javascript' src='sas/js/read_svg.js'></script> 
+    <script type='text/javascript' src='sas/js/zoom.js'></script> 
+    <script type='text/javascript' src='sas/js/toc.js'></script> 
+    <script type='text/javascript' src='sas/js/sas.js'></script> 
     <script type="text/javascript"> 
-    jQuery(document).ready(function(){
-        // Load and zoom m3ua.svg
-        var paper1 = Raphael("paper1", 1200, 700);
-        sas(paper1, "client-gateway-protocol.svg", function() {
-            //zoom(26, paper1);
-        });
-    });
+    $(document).ready(function(){ sas($('#content')).load(); });
     </script> 
     <style type="text/css">  
-            #canvas_container {  
-                width: 800px;
-                border: 1px solid #aaa;  
-            }  
             #content {display:none;}
     </style>  
 </head> 
 <body> 
-<h1>Protokoll diagram</h1>
-This diagram details the protocols used by the various components to deliver the M3UA functionality.
-<div id="paper1"></div> 
-<h1>Process distribution</h1>
-This diagram documents which processes run on which blade and how these processes communicate with each other.
-<div id="paper2"></div> 
-<div id="content">
-</div> <!-- end of #content div -->
-    <div id="idle_state">
-        <div class="tooltip">State <em>idle</em><table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table></div>
-        <div class="content">Asdf</div>
-    </div> <!-- end idle_state -->
+<div id="content"></div>
+<h1>Postlock system architecture</h1>
+<div id="fig1" class="sas_diagram">
+{
+    "svg": "svg/architecture.svg",
+    "html": ["html/architecture.html"],
+    "height": 800,
+    "width": 1000
+}
+</div>
+This diagram details asdf.
 </body> 
 </html> 

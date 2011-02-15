@@ -1,8 +1,9 @@
 # What is postlock? #
-A lockless concurrency library for Javascript. Postlock immediately applies your changes to shared data. In case of conflict, further operations resolve the issue. In addition to concurrency you get versioned persistence of your javascript data for free. [Here's a more detailed description (one page).] (https://docs1.google.com/document/d/1JePeVChpO2kUADC1Wu98QHpgqcDo8WvhXPHuETYLwN0/edit?hl=en#)
+The postlock project's goal is to provide globally shared state for application developers without requiring them to explicitly lock or synchronize anything. For more details, please visit <http://www.postlock.org>.
 
-# How do I use postlock? #
-Postlock is currently not ready to be used. We are working as fast as we can to deliver this awsome tool. If you help out, we'll get there faster...
+# What is the project's status? #
+Postlock is very much a work in progress, we're working to get unit tests off the ground.
 
-# How can I contribute? #
-Excellent question! Get the source, start looking at it, and turn to our [project page](http://neumark.github.com/postlock/) for more information. Also, join our [mailing list](http://groups.google.com/group/postlock)!
+Although you won't be able to build the next killer application for the web with postlock just yet, stay tuned, check back frequently, and -if you can- contribute!
+
+For details, see <http://www.postlock.org>.

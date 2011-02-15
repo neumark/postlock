@@ -1,3 +1,4 @@
+/*jslint white: true, onevar: true, undef: true, newcap: true, nomen: true, regexp: true, plusplus: true, bitwise: true, maxerr: 50, indent: 4 */
 /*
   postlock.js - javascript client API for postlock.
   author: neumark

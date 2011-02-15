@@ -18,7 +18,7 @@ connect_websocket(ArgHeaders, SessionId) ->
     % Request sync server for new client from plRegistry.
     case gen_server:call(plRegistry, {new_client, SessionId, {websocket, ArgHeaders}}) of
         {error, Reason} ->
-            io:format("Error initializing plSync server: ~p~n", [Reason]),
+            io:format("Error initializing plGateway server: ~p~n", [Reason]),
             {content, "text/plain", "Your browser seems to lack websockets support."};
         {ok, SyncServer, _ClientId} ->
             {websocket, gen_fsm:sync_send_event(SyncServer, {get_websocket_owner}), passive}

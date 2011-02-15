@@ -1,20 +1,33 @@
 %%%-------------------------------------------------------------------
-%%% File    : plSync.erl
+%%% File    : plGateway.erl
 %%% Author  : Peter Neumark
 %%% Description : 
-%%% A plSync process handles the dialog with the each client.
+%%% A plGateway process handles the dialog with the each client.
 %%% YAWS gives us the JSON-encoded message from the client, then
-%%% it's up to plSync to:
-%%% - Handle initialization of newly connected clients
-%%% - Read ACKs for server transactions from the message, and
-%%%   update the server's understanding of the client's state.
-%%% - Forward client transactions to the state server.
-%%% - Push modifications coming from state-server to the client
-%%%   through websockets.
+%%% it's up to plGateway to:
+%%% - Authenticate new clients
+%%% - Forward messages addressed to other postlock participants 
+%%%   on behalf of the client (send).
+%%% - Forward messages addressed to the client sent by other
+%%%   participants (receive).
+%%% - If the client disconnects, notify plSession and exit.
+%%%
+%%% The protocol used between plGateway and the client is documented
+%%% at: https://github.com/postlock/postlock/wiki/Client-Server-websocket-protocol
+%%%
+%%% The plGateway module is a gen_fsm server with the following states:
+%%% (details in: http://www.erlang.org/doc/man/gen_fsm.html )
+%%% 1. idle: the client is not connected
+%%% 2. auth: the client is undergoing authentication
+%%%    (cannot yet send/receive messages).
+%%% 3. connected: the client has authenticated itself,
+%%%    it is assumed that the underlying [web]socket connection
+%%%    is in connected state. When this is no longer the case,
+%%%    plGateway transitions back into the idle state.
 %%%
 %%% Created :  7 Dec 2010 by Peter Neumark
 %%%-------------------------------------------------------------------
--module(plSync).
+-module(plGateway).
 -behaviour(gen_fsm).
 
 %% API
@@ -25,7 +38,6 @@
         % state functions
         idle/2, idle/3,
         auth/2, auth/3,
-        initial_copy/2, initial_copy/3,
         connected/2, connected/3,
         % other functions
         connect_websocket/1,
@@ -40,23 +52,19 @@
 -include("yaws_api.hrl").
 
 -record(state, {
-          % The id of the client.
-          client_id,
+          % The participant id of the client.
+          participant_id,
           % The postlock user represented by
           % the client
-          user_id = "NA", %TODO: update auth-challege/response to set UID
-          % low-level websocket data from YAWS
-          websocket_data,
+          user_id, 
           % The PID of the process which owns the websocket, used to
           % push data to the client.
           websocket_owner,
-          % PID of the state server, which we forward transactions to
-          % and get updates from
-          state_server,
-          % transaction id counter
-          transaction_id = 0
+          % PID of the session server
+          session_server,
 }).
--define(DEFAULT_TIMEOUT, 100000).
+% Eventually, this should be configurable.
+-define(DEFAULT_TIMEOUT, 100000). 
 %%====================================================================
 %% API
 %%====================================================================
@@ -81,15 +89,17 @@ start_link(ServerData) ->
 %% gen_fsm:start_link/3,4, this function is called by the new process to 
 %% initialize. 
 %%--------------------------------------------------------------------
-init([StateServer, ClientId, {websocket, ArgsHeaders}]) ->
+init([SessionServer, ParticipantId, {websocket, ArgsHeaders}]) ->
+    % Don't die on 'EXIT' signal
     process_flag(trap_exit, true),
     % Initialize websocket
     case connect_websocket(ArgsHeaders) of
         {ok, WebSocketOwner} ->
             {ok, idle, #state{
-                   client_id = ClientId,
+                   participant_id = ParticipantId,
                    websocket_owner = WebSocketOwner,
-                   state_server = StateServer
+                   session_server = SessionServer
+                   % TODO: handle timeout event
              }, ?DEFAULT_TIMEOUT}; 
         {error, Reason} ->
             {stop, {websocket_error, Reason}}

@@ -157,7 +157,7 @@ create_sync_server(SessionId, WebSocketData) ->
     end),
     % spawn the new sync server:
     % TODO: handle cases where {error, Reason} is returned
-    case plSync:start_link([StateServer, ClientId, WebSocketData]) of
+    case plGateway:start_link([StateServer, ClientId, WebSocketData]) of
         {ok, NewSyncServer} ->
             % update record for current session in mnesia
             F = fun() ->

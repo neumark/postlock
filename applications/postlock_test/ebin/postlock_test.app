@@ -4,7 +4,7 @@
   {modules,[
 	postlock_test_app,
 	postlock_test_sup,
-	postlock_test_cb
+	postlock_test_server
 	]},
   {registered, [postlock_test_cb]},
   {mod,{postlock_test_app,[]}},

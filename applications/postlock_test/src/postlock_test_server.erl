@@ -1,34 +1,25 @@
 %%%-------------------------------------------------------------------
-%%% File    : plState.erl
-%%% Author  : Peter Neumark
+%%% File    : postlock_test_server.erl
+%%% Author  : Peter Neumark 
 %%% Description : 
 %%%
-%%% Created :  7 Dec 2010 by Peter Neumark
+%%% Created :  9 Dec 2010 by Peter Neumark 
 %%%-------------------------------------------------------------------
--module(plState).
+-module(postlock_test_server).
 
 -behaviour(gen_server).
 
 %% API
--export([start_link/1]).
+-export([start_link/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
-%% for development
--export([drop_tables/1]).
-
-% Needed for default table attributes.
--include("plRegistry.hrl").
-% Needed for mnesia records used by plState.
--include("plState.hrl").
-
 -record(state, {
-    session_server,
-    sessionid
+    sessionid = 0
 }).
-
+-define(SERVER, ?MODULE).
 %%====================================================================
 %% API
 %%====================================================================
@@ -36,8 +27,8 @@
 %% Function: start_link() -> {ok,Pid} | ignore | {error,Error}
 %% Description: Starts the server
 %%--------------------------------------------------------------------
-start_link(ServerArgs) ->
-    gen_server:start_link(?MODULE, [self() | ServerArgs], []).
+start_link() ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 %%====================================================================
 %% gen_server callbacks
@@ -50,17 +41,17 @@ start_link(ServerArgs) ->
 %%                         {stop, Reason}
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
-init([SessionServer, SessionId]) ->
-    process_flag(trap_exit, true),
-    make_session_tables(SessionId), 
-    create_root_node(SessionId),
-    {ok, #state{
-        session_server = SessionServer,
-        sessionid = SessionId
-    }}.
+init([]) ->
+
+    io:format("attempting to start new session~n",[]),
+    case gen_server:call(plRegistry,{new_session, ?SERVER}) of
+        {ok, SessionId} -> 
+            {ok, #state{sessionid=SessionId}};
+        {error, Reason} -> {stop, Reason}
+    end.
 
 %%--------------------------------------------------------------------
-%% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
+%% Function: handle_call(Request, From, State) -> {reply, Reply, State} |
 %%                                      {reply, Reply, State, Timeout} |
 %%                                      {noreply, State} |
 %%                                      {noreply, State, Timeout} |
@@ -68,17 +59,11 @@ init([SessionServer, SessionId]) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call({get_num_public_objects}, _From, State) ->
-    % STUB
-    Reply = 0,
-    {reply, Reply, State};
-
-handle_call({get_object, Oid}, _From, State) ->
-    % STUB
-    {reply, get_object(State#state.sessionid, Oid), State};
+handle_call({get_sessionid}, _From, State) ->
+    {reply, State#state.sessionid, State};
 
 handle_call(Request, _From, State) ->
-    io:format("plState:handle_call got ~p~n",[Request]),
+    io:format("Unhandled request sent to postlock_test_cb:handle_call - ~p~n",[Request]),
     Reply = ok,
     {reply, Reply, State}.
 
@@ -89,7 +74,7 @@ handle_call(Request, _From, State) ->
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
 handle_cast(Msg, State) ->
-    io:format("plState:handle_cast got ~p~n",[Msg]),
+    io:format("Unhandled cast sent to postlock_test_cb:handle_cast/2 - ~p~n",[Msg]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -98,7 +83,8 @@ handle_cast(Msg, State) ->
 %%                                       {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
-handle_info(_Info, State) ->
+handle_info(Info, State) ->
+    io:format("Unhandled info sent to postlock_test_cb:handle_info/2 - ~p~n",[Info]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -121,39 +107,3 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
-
-sessionid_to_tablenames(SessionId) ->
-    [
-    erlang:list_to_atom("pl_objects_" ++ erlang:integer_to_list(SessionId)),
-    erlang:list_to_atom("pl_transformations_" ++ erlang:integer_to_list(SessionId))
-    ].
-
-make_session_tables(SessionId) ->
-    [ObjTable, TransTable] = sessionid_to_tablenames(SessionId),
-	mnesia:create_table(ObjTable, 
-        [{record_name, postlock_object} | [{attributes, record_info(fields,postlock_object)}|
-        ?POSTLOCK_DEFAULT_TABLE_ARGS]]),
-	mnesia:create_table(TransTable, 
-        [{record_name, postlock_transformation} | [{attributes, record_info(fields,postlock_transformation)}|
-        ?POSTLOCK_DEFAULT_TABLE_ARGS]]),
-    error_logger:info_report(["Tables created successfully for session", SessionId]).
-
-create_root_node(SessionId) ->
-    [ObjTable|_] = sessionid_to_tablenames(SessionId),
-    Root = #postlock_object{
-        oid="0.0",
-        content=#postlock_content_dict{}
-    },
-    mnesia:transaction(fun() -> mnesia:write(ObjTable, Root, write) end),
-    error_logger:info_report(["Root node created for session", SessionId]).
-
-get_object(SessionId, Oid) ->
-    [ObjTable|_]= sessionid_to_tablenames(SessionId),
-    {atomic, ObjData} = mnesia:transaction(fun() -> mnesia:read(ObjTable, Oid, read) end),
-    case ObjData of
-        [] ->  undefined;
-        [Obj] -> Obj
-    end.
-
-drop_tables(SessionId) ->
-    [mnesia:delete_table(T) || T <- sessionid_to_tablenames(SessionId)].

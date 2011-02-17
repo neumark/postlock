@@ -38,11 +38,11 @@ start_link() ->
 %%                         {stop, Reason}
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
-init([]) ->
+init(_) ->
     % TODO: read state from mnesia
     process_flag(trap_exit, true),
     make_tables(),
-    fill_tables(),
+    init_postlock_global(),
     {ok, []}.
 
 %%--------------------------------------------------------------------
@@ -56,12 +56,8 @@ init([]) ->
 %%--------------------------------------------------------------------
 %% Creates a new sync server with a brand new client id, then registers
 %% the sync server with the state server responsible for the session.
-handle_call({new_client, SessionId, WebSocketData}, _From, State) ->
-    % TODO: maybe we should wrap this in a try block
-    {reply, create_sync_server(SessionId, WebSocketData), State};
-
-handle_call({new_session, CallbackServer}, _From, State) ->
-    Reply = create_state_server(CallbackServer),
+handle_call({new_session, Callback}, _From, State) ->
+    Reply = create_session(Callback),
     {reply, Reply, State};
 
 handle_call(Request, _From, State) ->
@@ -87,12 +83,12 @@ handle_cast(Msg, State) ->
 %%--------------------------------------------------------------------
 handle_info({'EXIT', Pid, Reason}, State) ->
     %% Todo: handle EXIT messages from sync and state servers!
-    io:format("Sync/State server with PID ~p died! Reason: ~p~nTODO: restart server, update mnesia!~n",[Pid, Reason]),
+    io:format("Linked process with PID ~p died! Reason: ~p~n",[Pid, Reason]),
     {noreply, State};
 
 handle_info(Info, State) ->
     %% Todo: handle EXIT messages from sync and state servers!
-    io:format("Unhandled request sent to plRegistry:handle_info - ~p~n",[Info]),
+    io:format("Unhandled request sent to plRegistry:handle_info - ~p~nin state~p~n",[Info, State]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -126,54 +122,8 @@ get_next_session_id() ->
     {atomic, S} = mnesia:transaction(F),
     S.
 
-get_next_client_id(SessionId) ->
-    F = fun() ->
-        [OldSessionRec] = mnesia:read(postlock_session, SessionId),
-        ClientId = OldSessionRec#postlock_session.next_client_id,
-        NewSessionRec = OldSessionRec#postlock_session{next_client_id=ClientId+1},
-        mnesia:write(NewSessionRec),
-        ClientId
-    end,
-    {atomic, S} = mnesia:transaction(F),
-    S.
-
 %%--------------------------------------------------------------------
-%% Function: create_sync_server(SessionId, StateServer, Websocket) -> 
-%%                                      {ok, SyncServer, ClientId} |
-%%                                      {error, Reason}
-%% Description: 
-%% Creates a new sync server, to be called when a new client connects.
-%% The postlock_session.clients field in mnesia corresponding to the
-%% given SessionId is updated to include the new sync server.
-%%--------------------------------------------------------------------
-create_sync_server(SessionId, WebSocketData) ->
-    % get client id for new client.
-    ClientId = get_next_client_id(SessionId),
-    % TODO: handle case where SessionId does not refer to a valid
-    % session.
-    {atomic, StateServer} = mnesia:transaction(fun() ->
-        [Rec] = mnesia:read(postlock_session, SessionId),
-        Rec#postlock_session.state_server
-    end),
-    % spawn the new sync server:
-    % TODO: handle cases where {error, Reason} is returned
-    case plGateway:start_link([StateServer, ClientId, WebSocketData]) of
-        {ok, NewSyncServer} ->
-            % update record for current session in mnesia
-            F = fun() ->
-                [SessionRec] = mnesia:read({postlock_session, SessionId}),
-                NewSessionRec = SessionRec#postlock_session{clients=
-                    gb_trees:enter(ClientId, NewSyncServer, SessionRec#postlock_session.clients)},
-                mnesia:write(NewSessionRec)
-            end,
-            mnesia:transaction(F),
-            {ok, NewSyncServer, ClientId};
-        {error, Reason} ->
-            {error, {sync_server_init_error, Reason}}
-    end.
-
-%%--------------------------------------------------------------------
-%% Function: create_state_server(CallbackServer) -> 
+%% Function: create_session(Callback) -> 
 %%                                      {ok, StateServer, SessionId} |
 %%                                      {error, Reason}
 %% Description: 
@@ -181,22 +131,24 @@ create_sync_server(SessionId, WebSocketData) ->
 %% callback server is connected. A new record is created in the 
 %% postlock_session mnesia table.
 %%--------------------------------------------------------------------
-create_state_server(CallbackServer) ->
+create_session(Callback) ->
     SessionId = get_next_session_id(),
-    io:format(" -------------- sessionid ~p~n", [SessionId]),
-    % TODO: handle cases where {error, Reason} is returned
-    {ok, NewStateServer} = plState:start_link([SessionId, CallbackServer]),
-    % save state server PID to mnesia
-    NewSessionRec = #postlock_session{id = SessionId, state_server = NewStateServer},
-    io:format("NewSessionRec: ~p~n", [NewSessionRec]),
-    mnesia:transaction(fun() -> mnesia:write(NewSessionRec) end),
-    {NewStateServer, SessionId}.
+    case plSession:start_link([SessionId, Callback]) of
+        {ok, Pid} = Ret ->
+            %% write new session record to mnesia
+            mnesia:transaction(fun() -> mnesia:write(#postlock_session{
+                id = SessionId,
+                session_server = Pid
+            }) end),
+            Ret;
+        {error, _Reason} = Err -> Err
+    end.
 
 make_tables() ->
     DefaultArgs = ?POSTLOCK_DEFAULT_TABLE_ARGS,
     [make_table_1(TableName, 
         [{attributes, Fields} | Args ++ DefaultArgs]) 
-      || {TableName, Fields, Args} <- [
+        || {TableName, Fields, Args} <- [
         % list of table names, with list of arguments for table
         {postlock_global, record_info(fields,postlock_global), []},
         {postlock_session, record_info(fields,postlock_session), []}
@@ -212,11 +164,23 @@ make_table_1(TableName, Args) ->
             ok
     end.
 
-fill_tables() ->
+init_postlock_global() ->
     %% insert the single record into postlock_global
-    mnesia:transaction(fun() -> mnesia:write(#postlock_global{}) end),
-    ok.
+    %% if none exist yet
+    mnesia:transaction(fun() -> 
+        case mnesia:last(postlock_global) of
+            0 -> ok;
+            _ -> mnesia:write(#postlock_global{})
+        end
+    end).
 
 drop_tables() ->
+    % drop tables for each session:
+    {atomic, SessionId} = mnesia:transaction(fun() ->
+        [OldGlobalRec] = mnesia:read(postlock_global, 0),
+        SessionId = OldGlobalRec#postlock_global.next_session_id,
+        SessionId
+    end),
+    [plState:drop_tables(Sid) || Sid <- lists:seq(0, SessionId -1)],
 	mnesia:delete_table(postlock_global),
 	mnesia:delete_table(postlock_session).

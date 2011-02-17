@@ -18,34 +18,16 @@
 -record(postlock_global, {
     key                    = 0, % just to keep mnesia happy
     next_session_id        = 0,
-    config                  % optional configuration
-}).
-
-%%% ----------------------------------------------------------
-%%% postlock_client - table to keep track of clients
-%%% each client belongs to a single session. If a single
-%%% application participates in several sessions, then it will
-%%% need a separate user id for each session.
-%%% ----------------------------------------------------------
--record(postlock_client, {
-    id,                     % {user_id, session_id} (key)
-    created,                % output of erlang:now(), 
-                            % date the user joined
-    sync_server_pid         % pid of sync server of client
-
+    config                  % optional configuration -empty now
 }).
 
 %%% ----------------------------------------------------------
 %%% postlock_session - the list of postlock session.
 %%% ----------------------------------------------------------
 -record(postlock_session, {
-    id,                     % integer (key)
-    state_server,       % PID of state server for session
-    creation_date          = now(),   % format of erlang:now()
-    next_client_id         = 0,
-    next_transformation_id = 0,
-    clients                = gb_trees:empty() % contains 
-                            % clientid -> #postlock_client
+    id,                     % session id - integer (key)
+    session_server,         % PID of state server for session
+    creation_date = now()   % format of erlang:now()
 }).
 
 

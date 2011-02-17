@@ -2,9 +2,11 @@
  [{description,"Postlock server"},
   {vsn,"0.0001"},
   {modules,[
-    plSync, 
+    plCallbackMgr,
+    plGateway, 
     plRegistry,
     plState, 
+    plSession,
     plApp,
     plApi]},
   {registered, [plRegistry]},

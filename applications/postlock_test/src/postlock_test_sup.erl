@@ -39,8 +39,8 @@ start_link(_) ->
 %% specifications.
 %%--------------------------------------------------------------------
 init([]) ->
-    Cb = {postlock_test_cb,{postlock_test_cb, start_link,[]},
-                         permanent,2000,worker,[postlock_test_cb]},
+    Cb = {postlock_test_server,{postlock_test_server, start_link,[]},
+                         permanent,2000,worker,[postlock_test_server]},
     {ok,{{one_for_one,0,5}, [Cb]}}.
 
 %%====================================================================

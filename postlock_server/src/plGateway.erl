@@ -1,6 +1,6 @@
 %%%-------------------------------------------------------------------
 %%% File    : plGateway.erl
-%%% Author  : Peter Neumark
+%%% Author  : Peter Neumark <neumark@postlock.org>
 %%% Description : 
 %%% A plGateway process handles the dialog with the each client.
 %%% YAWS gives us the JSON-encoded message from the client, then
@@ -12,9 +12,6 @@
 %%%   participants (receive).
 %%% - If the client disconnects, notify plSession and exit.
 %%%
-%%% The protocol used between plGateway and the client is documented
-%%% at: https://github.com/postlock/postlock/wiki/Client-Server-websocket-protocol
-%%%
 %%% The plGateway module is a gen_fsm server with the following states:
 %%% (details in: http://www.erlang.org/doc/man/gen_fsm.html )
 %%% 1. idle: the client is not connected
@@ -25,43 +22,73 @@
 %%%    is in connected state. When this is no longer the case,
 %%%    plGateway transitions back into the idle state.
 %%%
-%%% Created :  7 Dec 2010 by Peter Neumark
+%%% The wire protocol used between plGateway and the client is 
+%%% documented at: 
+%%% https://github.com/postlock/postlock/wiki/Client-Server-websocket-protocol
+%%%
+%%% plGateway is an implementation of a FSM (note that
+%%% the server and client are in the same state). The following
+%%% demonstrates the successful connection buildup sequence.
+%%% If an unexpected message is received or no message is
+%%% sent in the timeout window, then the state is set back
+%%% to idle (or the client/server disconnects).
+%%% 
+%%% plGateway                         Client
+%%% ---------                         ------
+%%% =========== state: idle ================
+%%%   {type: "client_connect"}
+%%%  <-------------------------------------
+%%%   {type: "server_connect"}
+%%%  ------------------------------------->
+%%%  // at this point we can be sure that the
+%%%  // websocket connection works both ways
+%%% =========== state: auth ================
+%%%   {type: "auth_challenge", msg: <challenge>}
+%%%  ------------------------------------->
+%%%   {type: "auth_response", msg: <response>}
+%%%  <-------------------------------------
+%%%   {type: "auth_ack", msg: <user_data>}
+%%%  ------------------------------------->
+%%% =========== state: connected ================
+%%%  // from this point, messages are forwarded
+%%%  // to the session server for processing or
+%%%  // delivery to the destination participant.
+%%% 
+%%% Created :  7 Dec 2010 by Peter Neumark <neumark@postlock.org>
 %%%-------------------------------------------------------------------
 -module(plGateway).
 -behaviour(gen_fsm).
 
-%% API
--export([start_link/1]).
-
 %% gen_fsm callbacks
--export([
+-export([start_link/1,
         % state functions
         idle/2, idle/3,
         auth/2, auth/3,
         connected/2, connected/3,
         % other functions
-        connect_websocket/1,
-        websocket_owner/1,
+        websocket_owner/2,
         % standard gen_fsm exports
         handle_event/3, handle_sync_event/4, handle_info/3, terminate/3,
         code_change/4, init/1]).
-
--include("plState.hrl").
--include("plMessage.hrl").
--include("plError.hrl").
+% Required to parse YAWS Args term
 -include("yaws_api.hrl").
+% Required for #pl_client_msg
+-include("plMessage.hrl").
+% Required for #pl_participant
+-include("plSession.hrl").
+% Required for error codes
+-include("plError.hrl").
 
 -record(state, {
-          % The participant id of the client.
-          participant_id,
-          % The postlock user represented by
-          % the client
-          user_id, 
+          % The participant's data
+          participant,
           % The PID of the process which owns the websocket, used to
           % push data to the client.
           websocket_owner,
-          % PID of the session server
+          % PID of the session server.
           session_server,
+          % Used to store temporary data
+          scratch
 }).
 % Eventually, this should be configurable.
 -define(DEFAULT_TIMEOUT, 100000). 
@@ -74,7 +101,7 @@
 %% initialize. To ensure a synchronized start-up procedure, this function
 %% does not return until Module:init/1 has returned.  
 %%--------------------------------------------------------------------
-start_link(ServerData) ->
+start_link(ServerData = [_SessionServer, _ParticipantId, _Connection]) ->
     gen_fsm:start_link(?MODULE, ServerData, []).
 
 %%====================================================================
@@ -93,10 +120,10 @@ init([SessionServer, ParticipantId, {websocket, ArgsHeaders}]) ->
     % Don't die on 'EXIT' signal
     process_flag(trap_exit, true),
     % Initialize websocket
-    case connect_websocket(ArgsHeaders) of
+    case connect_websocket(ParticipantId, ArgsHeaders) of
         {ok, WebSocketOwner} ->
             {ok, idle, #state{
-                   participant_id = ParticipantId,
+                   participant = #pl_participant{id = ParticipantId},
                    websocket_owner = WebSocketOwner,
                    session_server = SessionServer
                    % TODO: handle timeout event
@@ -108,118 +135,84 @@ init([SessionServer, ParticipantId, {websocket, ArgsHeaders}]) ->
 %%--------------------------------------------------------------------
 %% state: idle 
 %%--------------------------------------------------------------------
-
-idle({client_message, Msg}, State) when Msg#postlock_message.type == "client_connect" ->
+idle({client_message, Msg}, State) when Msg#pl_client_msg.type == "client_connect" ->
     % put websocket in active mode
     State#state.websocket_owner ! {set_active_mode},
     % send server_connect message
-    State#state.websocket_owner ! {send, plMessage:make_message("server_connect")},
+    State#state.websocket_owner ! {send, finalize_client_msg(#pl_client_msg{type="server_connect"})},
     % send auth_challenge, which puts client in auth state.
-    State#state.websocket_owner ! {send, plMessage:make_message("auth_challenge")},
-    {next_state, auth, State, ?DEFAULT_TIMEOUT};
+    {ok, AuthChallengeFun} = gen_server:call(State#state.session_server, {get_callback, auth_challenge}),
+    AuthChallenge = AuthChallengeFun(),
+    State#state.websocket_owner ! {send, finalize_client_msg(#pl_client_msg{
+        type="auth_challenge",
+        body=AuthChallenge})},
+    {next_state, auth, State#state{scratch=AuthChallenge}, ?DEFAULT_TIMEOUT};
 
 idle(Event, State) ->
-    io:format("plSync:idle/2 got unexpected event ~p~n", [Event]),
+    io:format("plGateway:idle/2 got unexpected event ~p~n", [Event]),
     {next_state, idle, State}.
 
 idle({get_websocket_owner}, _From, State) ->
+    % TODO: handle timeout event
     {reply, State#state.websocket_owner, idle, State};
 
 idle(Event, _From, State) ->
     % NOT USED
-    io:format("plSync:idle/3 got unexpected event ~p~n", [Event]),
+    io:format("plGateway:idle/3 got unexpected event ~p~n", [Event]),
     {reply, ok, idle, State}.
 
 %%--------------------------------------------------------------------
 %% state: auth
 %%--------------------------------------------------------------------
 
-auth({client_message, Msg}, State) when Msg#postlock_message.type == "auth_response" ->
-    NumPublicObjects = gen_server:call(State#state.state_server, {get_num_public_objects}),
-    OutMsg = plMessage:make_message("client_data", [], 
-        {struct, [{"client_id", State#state.client_id}, {"num_objects", NumPublicObjects}]}),
-    State#state.websocket_owner ! {send, OutMsg},
-    {NewState, _CopiedSet} = do_initial_copy(State),
-    % send ourselves a copy_finished message.
-    gen_fsm:send_event(self(), {copy_finished}),
-    {next_state, initial_copy, NewState};
+auth({client_message, Msg}, State) when Msg#pl_client_msg.type == "auth_response" ->
+    % Pass auth response to callback:
+    {ok, AuthenticateFun} = gen_server:call(State#state.session_server, {get_callback, authenticate}),
+    {Result, ClientResponse} = case AuthenticateFun(State#state.scratch, Msg#pl_client_msg.body) of
+        {ok, Username} ->
+            % update participant data in state
+            UpdatedPData = (State#state.participant)#pl_participant{
+                username = Username},
+            NewState = State#state{participant = UpdatedPData},
+            % update user data in session server
+            gen_server:cast(State#state.session_server, 
+                {update_participant_data, UpdatedPData}),
+           {{next_state, connected, NewState},
+            {struct, [
+                    {"result", "success"},
+                    {"id", (State#state.participant)#pl_participant.id}
+            ]}};
+        {error, Reason} ->
+            {{stop, {auth_failure, Reason}},
+             {struct, [
+                    {"error", ?ERROR2JSON(?PL_ERR_AUTH_FAILURE)},
+                    {"details", Reason}
+             ]}}
+    end,
+    % send auth_response to client
+    State#state.websocket_owner ! {send, finalize_client_msg(#pl_client_msg{
+                    type="auth_response",
+                    body=ClientResponse})},
+    Result;
 
 auth(Event, State) ->
-    io:format("plSync:auth/2 got unexpected event ~p~n", [Event]),
+    io:format("plGateway:auth/2 got unexpected event ~p~n", [Event]),
     {next_state, auth, State}.
 
 auth(Event, _From, State) ->
-    io:format("plSync:auth/3 got unexpected event ~p~n", [Event]),
+    io:format("plGateway:auth/3 got unexpected event ~p~n", [Event]),
     {reply, ok, auth, State}.
-
-%%--------------------------------------------------------------------
-%% state: initial_copy
-%% At this point the transfer of object has already been completed.
-%% We only need to transfer pending transactions, and send a
-%% copy_finished message when done.
-%%--------------------------------------------------------------------
-initial_copy({copy_finished}, State) ->
-    State#state.websocket_owner ! {send, plMessage:make_message("copy_finished")},
-    {next_state, initial_copy, State};
-
-initial_copy({client_message, Msg}, State) when Msg#postlock_message.type == "ack_copy" ->
-    {next_state, connected, State};
-
-initial_copy({client_message, Msg}, State) ->
-    io:format("unpextected message in initial_copy from client: ~p~n", [Msg]),
-    State#state.websocket_owner ! {send, plMessage:make_error(?BAD_SYNC_STATE_FOR_CLIENT_MESSAGE)},
-    {next_state, initial_copy, State};
-
-initial_copy({server_message, Msg}, State) ->
-    io:format("TODO: relay server message to client ~p~n", [Msg]),
-    {next_state, inital_copy, State};
-
-initial_copy(Event, State) ->
-    io:format("plSync:initial_copy/2 got unexpected event ~p~n", [Event]),
-    {next_state, initial_copy, State}.
-
-initial_copy(Event, _From, State) ->
-    io:format("plSync:initial_copy/3 got unexpected event ~p~n", [Event]),
-    {reply, ok, initial_copy, State}.
 
 %%--------------------------------------------------------------------
 %% state: connected
 %%--------------------------------------------------------------------
-connected({client_message, Msg}, State) when Msg#postlock_message.type == "transaction" ->
-    T = 
-    try
-        {ok, Transformations} = plMessage:parse_transformations(Msg#postlock_message.body),
-        % TODO: check that TID is the next expected TID from client!
-        {ok, Tid} = plMessage:json_get_value([id], Msg#postlock_message.header),
-        Transaction = #postlock_transaction{
-            id=Tid,
-            client_id=State#state.client_id,
-            user_id=State#state.user_id
-        },
-        {ok, {Transaction, Transformations}}
-    catch error:{badmatch, Reason} -> 
-        {error, ["Error parsing transaction", State, Msg, Reason]}
-    end,
-    case T of
-        {ok, Tdata} ->
-            gen_server:cast(State#state.state_server, {client_transaction, Tdata});
-        {error, E} ->
-            error_logger:info_report(E),
-            State#state.websocket_owner ! {send, 
-                plMessage:make_error(?ERROR_PARSING_TRANSACTION, 
-                json:obj_store(
-                    "transaction_header",
-                    Msg#postlock_message.header,
-                    json:obj_new()))}
-    end,
-    {next_state, connected, State};
 
 connected(Event, State) ->
-    io:format("plSync:connected/2 got unexpected event ~p~n", [Event]),
+    io:format("plGateway:connected/2 got unexpected event ~p~n", [Event]),
     {next_state, connected, State}.
 
 connected(Event, _From, State) ->
-    io:format("plSync:connected/3 got unexpected event ~p~n", [Event]),
+    io:format("plGateway:connected/3 got unexpected event ~p~n", [Event]),
     {reply, ok, connected, State}.
 
 %%--------------------------------------------------------------------
@@ -265,6 +258,11 @@ handle_sync_event(_Event, _From, StateName, State) ->
 %% other message than a synchronous or asynchronous event
 %% (or a system message).
 %%--------------------------------------------------------------------
+handle_info({'EXIT', Pid, Reason}, StateName, State) ->
+    %% Todo: handle EXIT messages from sync and state servers!
+    io:format("Linked process with PID ~p died! Reason: ~p~nStateName: ~p~nState:~p~n",[Pid, Reason, StateName, State]),
+    {next_state, StateName, State};
+
 handle_info(_Info, StateName, State) ->
     {next_state, StateName, State}.
 
@@ -290,171 +288,82 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %% Internal functions
 %%--------------------------------------------------------------------
 
-%%--------------------------------------------------------------------
-%% Function: 
-%% do_initial_copy(State)-> NewState
-%%                                     
-%% Description: This function is called by init_client to replicate
-%% the server state to the client. Since we don't lock state while
-%% do_initial_copy is running, transactions from other clients will
-%% be applied while do_inital_copy is running. As a result, the client
-%% will get an inconsistent version of the global state.
-%% Some of the transactions which occurred during do_initial_copy must
-%% be run by the client later on.
-%% We copy leaf nodes (objects of type data) first. Once all the
-%% children of a list/dict are copied, we can copy the list also.
-%% Note that objects can belong to several parents, so a naive
-%% implementation could potentially be susceptible to infinite loops.
-%%--------------------------------------------------------------------
-do_initial_copy(State) ->
-    do_initial_copy_1(
-        [gen_server:call(State#state.state_server, {get_object, "0.0"})], 
-        gb_trees:empty(), 
-        State).
-
-do_initial_copy_1([], CopiedSet, State) ->
-    {State, CopiedSet};
-do_initial_copy_1(AwaitingCopy = [NextObject|Rest], CopiedSet, State) ->
-    case can_send_object(NextObject, CopiedSet, State#state.state_server) of
-        already_sent ->
-            do_initial_copy_1(Rest, CopiedSet, State);
-        can_send ->
-            NewState = send_object(NextObject, State),
-            NewSet = gb_trees:enter(plObject:get_oid(NextObject), NextObject, CopiedSet),
-            do_initial_copy_1(Rest, NewSet, NewState);
-        Prerequisites ->
-            % Add the prerequisites to the front of the queue.
-            NewQueue = lists:foldl(fun(X,L) -> [X|L] end, AwaitingCopy, Prerequisites),
-            do_initial_copy_1(NewQueue, CopiedSet, State)
-    end.
-
-send_object(Obj, State) ->
-    % TODO Maybe I'll be smarter about this and not send
-    % every object in its own transaction, but its 
-    % quick and dirty time now! :)
-    Tid = State#state.transaction_id,
-    NewState = State#state{transaction_id = Tid + 1},
-    Transformation = plObject:make_create_transformation(Obj),
-    Transaction = lists:foldl(
-        fun({Fun,Value},T) -> erlang:apply(plMessage,Fun,[Value,T]) end,
-        % start with an empty transaction
-        plMessage:transaction_new(),
-        % apply the following list of commands
-        [
-            {transaction_set_id, Tid}, 
-            {transaction_set_user, State#state.user_id}, 
-            {transaction_set_client, State#state.client_id}, 
-            {transaction_add_transformation, Transformation} 
-        ]),
-    % send Transaction to client
-    State#state.websocket_owner ! {send, 
-        plMessage:transaction_serialize(Transaction)},
-    NewState.
-
-can_send_object(Object, CopiedSet, StateServer) ->
-    case gb_trees:is_defined(plObject:get_oid(Object), CopiedSet) of
-        true ->
-            already_sent;
-        false ->
-            Children = plObject:get_children(Object, StateServer),
-            Uncopied = lists:filter(
-                fun(Child) -> gb_trees:is_defined(Child, CopiedSet) end,
-                Children),
-            case Uncopied of 
-                [] -> can_send;
-                List -> List
-            end
-    end.
-
-%%--------------------------------------------------------------------
-%% Function: 
-%% process_pending_transformation(Transformation, State)-> NewState
-%%                                     
-%% Description: This function is called by init_client to foward a
-%% server transformation received during do_initial_copy. 
-%% Only transformations not yet applied to the copied object are
-%% forwarded.
-%%--------------------------------------------------------------------
-%process_pending_transformation(_Transformation, State) ->
-%    % STUB -- do nothing for now.
-%    State.
-   
-%%--------------------------------------------------------------------
-%% Input message parsing functions
-%%--------------------------------------------------------------------
-%
-%json_to_transaction(JsonMessage) ->
-%    try
-%        {ok, Id} = plMessage:json_get_value([header, id], JsonMessage),
-%        {_, AckList} = plMessage:json_get_value([body, response, ack], JsonMessage, []),
-%        {ok, {array, Tlist}} = plMessage:json_get_value([body, transformations], JsonMessage),
-%        {ok, #postlock_transaction{
-%            id=Id,
-%            transformations = lists:map(fun interpret_transformation/1, Tlist)
-%        }}
-%    catch
-%        _:_ -> {error, ["failed to parse transaction", JsonMessage]}
-%    end.
-
-%interpret_transformation(TMsg) ->
-%    {ok, Cmd} = plMessage:json_get_value([command], TMsg),
-%    {_, Oid} = plMessage:json_get_value([parameters, oid], TMsg, none),
-%    {_, {struct, ParamList}} = plMessage:json_get_value([parameters], TMsg, {struct, []}),
-%    #postlock_transformation{
-%        cmd = Cmd,
-%        oid = Oid,
-%        parameters = ParamList
-%    }.
+finalize_client_msg(#pl_client_msg{} = Msg) ->
+    plMessage:finalize(?RECORD2JSON(pl_client_msg, Msg)).
 
 %% == Websocket handling functions ==
-connect_websocket(ArgsHeaders) ->
+connect_websocket(ParticipantId, ArgsHeaders) ->
     case get_upgrade_header(ArgsHeaders) of 
 	"WebSocket" ->
-	    WebSocketOwner = spawn_link(?MODULE, websocket_owner, [self()]),
+	    WebSocketOwner = spawn(?MODULE, websocket_owner, [ParticipantId, self()]),
 	    {ok, WebSocketOwner};
     BadHeader ->
         {error, {bad_header, BadHeader}}
     end.
 
-websocket_owner(SyncServer) ->
+websocket_owner(ParticipantId, Gateway) ->
     io:format("starting websocket_owner~n", []),
     receive
-	{ok, WebSocket} ->
-        self() ! yaws_api:websocket_receive(WebSocket),
-	    listen_loop(WebSocket, SyncServer);
-	BadValue ->
-        {error, BadValue}
+        {ok, WebSocket} ->
+            self() ! yaws_api:websocket_receive(WebSocket),
+            listen_loop({WebSocket, ParticipantId, Gateway});
+        BadValue ->
+            {error, BadValue}
     end.
 
-listen_loop(WebSocket, SyncServer) ->
+read_client_message(Gateway, ParticipantId, RawMsg) when is_binary(RawMsg) ->
+    read_client_message(Gateway, ParticipantId, erlang:binary_to_list(RawMsg));
+
+read_client_message(Gateway, ParticipantId, RawMsg) ->
+    try
+        {ok, Json} = json:decode_string(RawMsg),
+        {ok, Type} = plMessage:json_get_value([type],Json),
+        % Participant 0 is always the session server
+        % and the default recipient of messages
+        {_, To} = plMessage:json_get_value([to],Json, undefined),
+        {_, Body} = plMessage:json_get_value([body],Json, undefined),
+        gen_fsm:send_event(Gateway, {client_message, 
+            #pl_client_msg{
+                from=ParticipantId,
+                to=To,
+                type=Type,
+                body=Body
+            }})
+    catch 
+        error:{badmatch, _} -> 
+            % If we receive a bad message, do
+            % not forward to Gateway.
+            % TODO: send client an error message in response.
+            io:format("Got unparseable client msg: ~p~n", RawMsg)
+    end.
+
+listen_loop(LD={WebSocket,ParticipantId,Gateway}) ->
     receive
     {ok, [Message]} -> % used in 'passive mode'
-        gen_fsm:send_event(SyncServer, {client_message,
-            plMessage:parse_raw_message(Message)}),
-        listen_loop(WebSocket, SyncServer);
-	{tcp, WebSocket, DataFrame} -> % used in 'active mode'
+        read_client_message(Gateway, ParticipantId, Message),
+        listen_loop(LD);
+	{tcp, _WS, DataFrame} -> % used in 'active mode'
         % Try to decode all JSON messages 
         % received through the websocket.
-        [gen_fsm:send_event(SyncServer, {client_message, 
-            plMessage:parse_raw_message(erlang:binary_to_list(Msg))
-            }) || Msg <- yaws_websockets:unframe_all(DataFrame, [])],
-        listen_loop(WebSocket, SyncServer);
+        [read_client_message(Gateway, ParticipantId, Message)
+            || Message <- yaws_websockets:unframe_all(DataFrame, [])],
+        listen_loop(LD);
     {send, ToBeSent} ->
         yaws_api:websocket_send(WebSocket, ToBeSent),
-        listen_loop(WebSocket, SyncServer);
+        listen_loop(LD);
     {set_active_mode} ->
         yaws_api:websocket_setopts(WebSocket, [{active, true}]),
-        listen_loop(WebSocket, SyncServer);
+        listen_loop(LD);
 	{tcp_closed, WebSocket} ->
-        gen_fsm:send_all_state_event(SyncServer, websocket_closed),
+        %TODO: remove io:formats
 	    io:format("Websocket closed. Terminating listen_loop...~n"),
         {error, websocket_disconnect};
 	Any ->
 	    io:format("listen_loop received unexpected msg:~p~n", [Any]),
-        {error, websocket_disconnect}
+        {error, {unexpected, Any}}
     end.
 
-% From YAWS example
+% From YAWS example at http://yaws.hyber.org/websockets.yaws
 get_upgrade_header(#headers{other=L}) ->
     lists:foldl(fun({http_header,_,K0,_,V}, undefined) ->
                         K = case is_atom(K0) of

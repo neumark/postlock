@@ -47,7 +47,7 @@
 %%%  ------------------------------------->
 %%%   {type: "auth_response", msg: <response>}
 %%%  <-------------------------------------
-%%%   {type: "auth_ack", msg: <user_data>}
+%%%   {type: "auth_result", msg: <user_data>}
 %%%  ------------------------------------->
 %%% =========== state: connected ================
 %%%  // from this point, messages are forwarded
@@ -123,7 +123,9 @@ init([SessionServer, ParticipantId, {websocket, ArgsHeaders}]) ->
     case connect_websocket(ParticipantId, ArgsHeaders) of
         {ok, WebSocketOwner} ->
             {ok, idle, #state{
-                   participant = #pl_participant{id = ParticipantId},
+                   participant = #pl_participant{
+                    id = ParticipantId,
+                    process_id = self()},
                    websocket_owner = WebSocketOwner,
                    session_server = SessionServer
                    % TODO: handle timeout event
@@ -153,7 +155,6 @@ idle(Event, State) ->
     {next_state, idle, State}.
 
 idle({get_websocket_owner}, _From, State) ->
-    % TODO: handle timeout event
     {reply, State#state.websocket_owner, idle, State};
 
 idle(Event, _From, State) ->
@@ -180,18 +181,21 @@ auth({client_message, Msg}, State) when Msg#pl_client_msg.type == "auth_response
            {{next_state, connected, NewState},
             {struct, [
                     {"result", "success"},
-                    {"id", (State#state.participant)#pl_participant.id}
+                    {"participant_id", (State#state.participant)#pl_participant.id},
+                    {"session_id", gen_server:call(State#state.session_server, {get_session_id})}
             ]}};
         {error, Reason} ->
-            {{stop, {auth_failure, Reason}},
+            % Inform session server that we are stopping
+            on_disconnect(State, auth_failure, Reason),
+            {{stop, normal, State},
              {struct, [
-                    {"error", ?ERROR2JSON(?PL_ERR_AUTH_FAILURE)},
-                    {"details", Reason}
+                    {"result", "failure"},
+                    {"error", ?ERROR2JSON(?PL_ERR_AUTH_FAILURE)}
              ]}}
     end,
     % send auth_response to client
     State#state.websocket_owner ! {send, finalize_client_msg(#pl_client_msg{
-                    type="auth_response",
+                    type="auth_result",
                     body=ClientResponse})},
     Result;
 
@@ -206,6 +210,9 @@ auth(Event, _From, State) ->
 %%--------------------------------------------------------------------
 %% state: connected
 %%--------------------------------------------------------------------
+connected({client_message, #pl_client_msg{} = Msg}, State) ->
+    gen_server:cast(State#state.session_server, {deliver_message, Msg}),
+    {next_state, connected, State};
 
 connected(Event, State) ->
     io:format("plGateway:connected/2 got unexpected event ~p~n", [Event]),
@@ -259,11 +266,23 @@ handle_sync_event(_Event, _From, StateName, State) ->
 %% (or a system message).
 %%--------------------------------------------------------------------
 handle_info({'EXIT', Pid, Reason}, StateName, State) ->
-    %% Todo: handle EXIT messages from sync and state servers!
-    io:format("Linked process with PID ~p died! Reason: ~p~nStateName: ~p~nState:~p~n",[Pid, Reason, StateName, State]),
+    case Pid == State#state.websocket_owner of
+        % TCP connection was closed.
+        true ->
+            on_disconnect(State, remote_disconnect, []),
+            {stop, normal, State};
+        false ->
+            io:format("Linked process with PID ~p died! Reason: ~p~nStateName: ~p~nState:~p~n",[Pid, Reason, StateName, State]),
+            {next_state, StateName, State}
+    end;
+
+handle_info({participant_message, #pl_client_msg{} = Msg},
+    connected=StateName, #state{websocket_owner=WS}=State) ->
+    WS ! {send, finalize_client_msg(Msg)},
     {next_state, StateName, State};
 
-handle_info(_Info, StateName, State) ->
+handle_info(Info, StateName, State) ->
+    io:format("plGateway got unexpected message ~p in state ~p (state data ~p)~n", [Info, StateName, State]),
     {next_state, StateName, State}.
 
 %%--------------------------------------------------------------------
@@ -287,6 +306,9 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
+on_disconnect(State, Reason, Details) ->
+    gen_server:cast(State#state.session_server, 
+        {disconnect, {State#state.participant, Reason, Details}}).
 
 finalize_client_msg(#pl_client_msg{} = Msg) ->
     plMessage:finalize(?RECORD2JSON(pl_client_msg, Msg)).
@@ -295,21 +317,23 @@ finalize_client_msg(#pl_client_msg{} = Msg) ->
 connect_websocket(ParticipantId, ArgsHeaders) ->
     case get_upgrade_header(ArgsHeaders) of 
 	"WebSocket" ->
-	    WebSocketOwner = spawn(?MODULE, websocket_owner, [ParticipantId, self()]),
+	    WebSocketOwner = spawn_link(?MODULE, websocket_owner, [ParticipantId, self()]),
 	    {ok, WebSocketOwner};
     BadHeader ->
         {error, {bad_header, BadHeader}}
     end.
 
 websocket_owner(ParticipantId, Gateway) ->
-    io:format("starting websocket_owner~n", []),
-    receive
+    Reason = receive
         {ok, WebSocket} ->
+            % Uncomment the following line and recompile to start debugging:
+            % plDebug:start(),
             self() ! yaws_api:websocket_receive(WebSocket),
             listen_loop({WebSocket, ParticipantId, Gateway});
         BadValue ->
-            {error, BadValue}
-    end.
+            {websocket_error, BadValue}
+    end,
+    exit(Reason).
 
 read_client_message(Gateway, ParticipantId, RawMsg) when is_binary(RawMsg) ->
     read_client_message(Gateway, ParticipantId, erlang:binary_to_list(RawMsg));
@@ -320,8 +344,10 @@ read_client_message(Gateway, ParticipantId, RawMsg) ->
         {ok, Type} = plMessage:json_get_value([type],Json),
         % Participant 0 is always the session server
         % and the default recipient of messages
-        {_, To} = plMessage:json_get_value([to],Json, undefined),
+        {_, To} = plMessage:json_get_value([to],Json, 0),
         {_, Body} = plMessage:json_get_value([body],Json, undefined),
+        % To use seq_tracer, uncomment the following line:
+        % plDebug:trace_this(),
         gen_fsm:send_event(Gateway, {client_message, 
             #pl_client_msg{
                 from=ParticipantId,
@@ -338,6 +364,7 @@ read_client_message(Gateway, ParticipantId, RawMsg) ->
     end.
 
 listen_loop(LD={WebSocket,ParticipantId,Gateway}) ->
+    % TODO add 'after' clause with a configurable timeout.
     receive
     {ok, [Message]} -> % used in 'passive mode'
         read_client_message(Gateway, ParticipantId, Message),
@@ -355,12 +382,9 @@ listen_loop(LD={WebSocket,ParticipantId,Gateway}) ->
         yaws_api:websocket_setopts(WebSocket, [{active, true}]),
         listen_loop(LD);
 	{tcp_closed, WebSocket} ->
-        %TODO: remove io:formats
-	    io:format("Websocket closed. Terminating listen_loop...~n"),
-        {error, websocket_disconnect};
+        remote_disconnect;
 	Any ->
-	    io:format("listen_loop received unexpected msg:~p~n", [Any]),
-        {error, {unexpected, Any}}
+        {unexpected_message, Any}
     end.
 
 % From YAWS example at http://yaws.hyber.org/websockets.yaws

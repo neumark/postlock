@@ -35,6 +35,7 @@ json_get_value(KeyList, JsonMessage, DefaultValue) ->
 finalize(Struct) ->
     json:encode(Struct).
 
+
 %% == internal functions ==
 json_get_value_1([], Value) -> Value;
 json_get_value_1([Key|KeyList], Obj) ->

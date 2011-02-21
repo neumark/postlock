@@ -1,7 +1,11 @@
 <erl>
 out(A) ->
-    SessionId = gen_server:call(postlock_test_cb, {get_sessionid}),
-    Ret = plApi:connect_websocket(A#arg.headers, SessionId),
-    error_logger:info_report(["backend.yaws returning",Ret]),
-    Ret.
+    {_SessionId, SessionServer} = gen_server:call(postlock_test_server, {get_session}),
+    case gen_server:call(SessionServer, {connect_client, {websocket, A#arg.headers}}) of
+        {ok, WS} -> WS;
+        {error, Reason} ->
+            StrReason = lists:flatten(io_lib:format("~p", [Reason])),
+            {content, "text/plain", "Error establishing websocket connection: " + StrReason};
+        Other -> io:format("got ~p~n", [Other])
+    end.
 </erl>

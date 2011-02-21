@@ -17,7 +17,9 @@
          terminate/2, code_change/3]).
 
 -record(state, {
-    sessionid = 0
+    session_server,
+    sessionid,
+    callback_server
 }).
 -define(SERVER, ?MODULE).
 %%====================================================================
@@ -43,10 +45,18 @@ start_link() ->
 %%--------------------------------------------------------------------
 init([]) ->
 
-    io:format("attempting to start new session~n",[]),
-    case gen_server:call(plRegistry,{new_session, ?SERVER}) of
-        {ok, SessionId} -> 
-            {ok, #state{sessionid=SessionId}};
+    % start a new postlock session for test clients.
+    {ok, CbServer} = plCallbackMgr:start_link(),
+    % initialize authentication functions in CbServer
+    gen_server:cast(CbServer,{set_callback, {auth_challenge, fun trivial_auth_challenge/0}}),
+    gen_server:cast(CbServer,{set_callback, {authenticate, fun trivial_authenticate/2}}),
+    case gen_server:call(plRegistry,{new_session, CbServer}) of
+        {ok, {SessionId, SessionServer}} -> 
+            {ok, #state{
+                sessionid=SessionId,
+                session_server=SessionServer,
+                callback_server=CbServer
+                }};
         {error, Reason} -> {stop, Reason}
     end.
 
@@ -59,8 +69,8 @@ init([]) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call({get_sessionid}, _From, State) ->
-    {reply, State#state.sessionid, State};
+handle_call({get_session}, _From, State) ->
+    {reply, {State#state.sessionid, State#state.session_server}, State};
 
 handle_call(Request, _From, State) ->
     io:format("Unhandled request sent to postlock_test_cb:handle_call - ~p~n",[Request]),
@@ -107,3 +117,16 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
+
+trivial_auth_challenge() ->
+    {struct, [
+        {"challenge_type", "trivial"}
+    ]}.
+
+trivial_authenticate(_Challenge, Response) ->
+    Username = json:obj_fetch(username, Response),
+    Password = json:obj_fetch(password, Response),
+    case Username == Password of
+        true -> {ok, Username};
+        false -> {error, bad_password}
+    end.

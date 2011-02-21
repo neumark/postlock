@@ -134,13 +134,13 @@ get_next_session_id() ->
 create_session(Callback) ->
     SessionId = get_next_session_id(),
     case plSession:start_link([SessionId, Callback]) of
-        {ok, Pid} = Ret ->
+        {ok, Pid} ->
             %% write new session record to mnesia
             mnesia:transaction(fun() -> mnesia:write(#postlock_session{
                 id = SessionId,
                 session_server = Pid
             }) end),
-            Ret;
+            {ok, {SessionId, Pid}};
         {error, _Reason} = Err -> Err
     end.
 

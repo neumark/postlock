@@ -10,12 +10,13 @@
 
 */
 // mkPostlock: constructor for the main postlock module.
-var mkPostlock = function (websocket_url) {
+var mkPostlock = function (spec) {
 
     // PL: variable containing postlock instance 
     var PL = {
         config: {
-            ws_url: websocket_url 
+            participant_id: undefined,
+            session_id: undefined
         },
         counters: {},
         objects: {
@@ -54,12 +55,6 @@ var mkPostlock = function (websocket_url) {
         // - Utility functions -
         // ---------------------
         util: {
-            create_message: function (type, header, body) {
-                var obj = {type: type};
-                if (header !== undefined) obj.header = header;
-                if (body !== undefined) obj.body = body;
-                return obj;
-            },
             fire: function(oid, signal, args) {
                 return PL.objects.get(oid).cb.fire(signal,args);
             },
@@ -69,7 +64,6 @@ var mkPostlock = function (websocket_url) {
                     type: type,
                 };
             },
-            is_connected: function() {return false;},
             require_transaction: function (fun, t, t_spec) {
                 var ret = {}, apply_t = false;
                 if (!PL.util.is_transaction(t)) {
@@ -125,7 +119,7 @@ var mkPostlock = function (websocket_url) {
                 }
                 return to;
             },
-            copy_methods: function (src, dest) {
+            shallow_copy: function (src, dest) {
                 var i;
                 for (i in src) if (src.hasOwnProperty(i)) dest[i] = src[i];
                 return dest;
@@ -136,9 +130,9 @@ var mkPostlock = function (websocket_url) {
                     retries = num_retries || 5,
                     on_failure = cb_failure || function () {PL.util.throw_ex("retry_until failed", {args: PL.util.args2array(arguments)});},
                     do_try = function (r) {
-                        if (condition()) return cb_success();
-                        if (retries === 0) return on_failure();
-                        return setTimeout(function () {do_try(r-1);},ms);
+                        if (condition()) return {success: cb_success()};
+                        if (r === 0) return {failure: on_failure()};
+                        return {deferred: setTimeout(function () {do_try(r-1);},ms)};
                     };
                 return do_try(retries);
             },
@@ -213,7 +207,7 @@ var mkPostlock = function (websocket_url) {
         //      string name (optional)
         // }
         // MODULE PRIVATE DATA:
-        var my = {
+        var exports = {}, my = {
             async_delay: 4,
             id: spec.name || "[unnamed object]",
             // debug state:
@@ -246,18 +240,17 @@ var mkPostlock = function (websocket_url) {
                     result.user = my.user_cb[mapped_signal].apply(this,args_array);
                 }
                 return result;
-            }
+            },
+           return_this: spec.return_this || exports, // returned by set_cb functions, used for chaining calls.
         }; // END my    
-
-        // MODULE EXPORTS
-        return {
-            debug: function (new_debug_state) {my.debug = new_debug_state;},
-            set_internal_cb: function (signal, handler) {my.internal_cb[signal] = handler;},
+        PL.util.shallow_copy({
+            debug: function (new_debug_state) {my.debug = new_debug_state;return my.return_this;},
+            set_internal_cb: function (signal, handler) {my.internal_cb[signal] = handler;return my.return_this;},
             get_internal_cb: function (signal) {return my.internal_cb[signal];},
-            set_user_cb: function (signal, handler) {my.user_cb[signal] = handler;},
+            set_user_cb: function (signal, handler) {my.user_cb[signal] = handler;return my.return_this;},
             get_user_cb: function (signal) {return my.user_cb[signal];},
-            remove_internal_cb: function (signal) { delete my.internal_cb[signal];},
-            remove_user_cb: function (signal) { delete my.user_cb[signal];},
+            remove_internal_cb: function (signal) { delete my.internal_cb[signal];return my.return_this;},
+            remove_user_cb: function (signal) { delete my.user_cb[signal];return my.return_this;},
             fire: my.fire, 
             fire_async: function (signal, args) {setTimeout(function () {my.fire(signal, args);}, my.async_delay);},
             // used when we need a function which fires a signal. For example,
@@ -265,7 +258,10 @@ var mkPostlock = function (websocket_url) {
             wrap_signal: function (signal) {
                 return function () {my.fire(signal, arguments);}
             } 
-        };
+        }, exports);
+ 
+        // MODULE EXPORTS
+        return exports;
     };
 
    
@@ -439,7 +435,7 @@ var mkPostlock = function (websocket_url) {
             exports: my.exports,
             add_base_exports: function (desc) {
                 desc.exports = desc.exports || {};
-                PL.util.copy_methods(my.exports, desc.exports);
+                PL.util.shallow_copy(my.exports, desc.exports);
                 return desc;
             },
             add_transformation: function (command, parameters, transaction) {
@@ -706,21 +702,41 @@ var mkPostlock = function (websocket_url) {
        return ret;
    };
 
+    // MkGatewayConnection: encapsulates state for the connection to
+    // the plGateway process within the postlock server.
 
-
-    //  -------------------------
-    //  - MAIN TELEPATHY MODULE -
-    //  -------------------------
-    PL.modules.mkMain = function () {
-
-        // MODULE FIELDS
+    PL.modules.mkGatewayConnection = function(spec) {
         var my = {
-            // websocket object
-            connection: null, 
-            cb: PL.modules.mkCallbackManager({name:"main postlock object"}),
+            cb: spec.cb || PL.modules.mkCallbackManager({name:"gateway connection"}),
+            url: spec.url,
+            connection: null,
             state: 'idle',
             state_data: {},
             fun: {
+                disconnect: function(reason) {
+                    if (my.state !== 'idle') {
+                        my.fun.connection_state_change("disconnect", 'idle', {reason: reason});
+                        my.connection.close();
+                    }
+                },
+                send: function(msg) {
+                    if (my.state !== "connected") {
+                        PL.util.throw_ex(
+                        "Connection not yet ready!", {
+                        state: my.state,
+                        msg: msg });
+                    } else {
+                        return my.fun.websocket_safe_send(msg);
+                    }
+                },
+                connect: function () {
+                    my.connection=new WebSocket(my.url);
+                    // Set callbacks for websocket events.
+                    my.connection.onopen=my.cb.wrap_signal("ws_onopen");
+                    my.connection.onmessage=my.cb.wrap_signal("ws_onmessage");
+                    my.connection.onclose=my.cb.wrap_signal("ws_onclose");
+                    my.connection.onerror=my.cb.wrap_signal("ws_onerror");
+                },
                 connection_state_change: function(message, new_state, state_data) {
                     var oldstate = my.state;
                     my.state = new_state;
@@ -733,28 +749,23 @@ var mkPostlock = function (websocket_url) {
                     var data = JSON.stringify(data_obj);
                     PL.util.retry_until(
                         // condition
-                        function () { return PL.connection.readyState == 1;},
+                        function () { return my.connection.readyState == 1;},
                         // on success
                         function () {
-                            PL.connection.send(data);
+                            return my.connection.send(data);
                         }
                     );
                 },
-                create_object: function(spec, transaction) {
-                    var result; 
-                    result = PL.objects.get("meta_object").add_transformation(
-                        'create', {spec: spec}, transaction);
-                    // if the transaction has already been applied, then return
-                    // the newly created object.
-                    if (result.transaction.get_current_status() === 'applied') {
-                        return PL.objects.get(spec.oid).exports;
+                auth: {
+                    trivial: function() {
+                        return {username: spec.username, password: spec.password};
                     }
-                    return result;
                 },
                 // handle_incoming_msg.current is overwritten when a state change requires incoming messages
-                // to be handled in a new way. The handler for each state/substate is under
-                // handle_incoming_msg.state.substate or just .state if there is no substate.
+                // to be handled in a new way. The handler for each state is under
+                // handle_incoming_msg[state].
                 handle_incoming_msg: {
+                    current: null,
                     idle:  function (msg_obj) {
                         if (msg_obj.type === "server_connect") {
                             my.fun.connection_state_change(msg_obj, 'auth');
@@ -763,56 +774,59 @@ var mkPostlock = function (websocket_url) {
                     },
                     auth: function (msg_obj) {
                         switch (msg_obj.type) {
-                            case "auth_challenge": // Authentication is only a STUB right now.
-                                my.fun.websocket_safe_send(PL.util.create_message("auth_response"));
+                            case "auth_challenge": 
+                                if (!("challenge_type" in msg_obj.body)) throw_ex("bad auth challenge", {challenge: msg_obj});
+                                if (!(msg_obj.body["challenge_type"] in my.fun.auth)) throw_ex("unsupported auth type: "+ msg_obj.body["challenge_type"], {challenge: msg_obj});
+                                my.fun.websocket_safe_send({type: "auth_response", body: my.fun.auth[msg_obj.body["challenge_type"]](msg_obj)});
                                 break;
-                            case "client_data":
-                                // set client id.
-                                PL.config.client_id = msg_obj.body.client_id;
-                                PL.counters.object_id.set_prefix(msg_obj.body.client_id + ".");
-                                my.fun.connection_state_change(msg_obj, 'initial_copy', {num_objects: msg_obj.body.num_objects});
+                            case "auth_result":
+                                switch ((msg_obj.body && ("result" in msg_obj.body))?msg_obj.body['result']:"") {
+                                    case 'success':
+                                        // set client id.
+                                        PL.config['participant_id'] = msg_obj.body.participant_id;
+                                        PL.config['session_id'] = msg_obj.body.participant_id;
+                                        // set prefix for oid's created by this participant.
+                                        PL.counters.object_id.set_prefix(msg_obj.body.participant_id + ".");
+                                        my.fun.connection_state_change(msg_obj, 'connected');
+                                        my.cb.fire_async('connected');
+                                        break;
+                                    case 'failure':
+                                        my.fun.disconnect("auth_failure");
+                                        break;
+                                    default:
+                                        // missing or unexpected "result" -> bad message!
+                                        return false;
+                                };
                                 break;
                             default:
-                                return false;
-                        };
-                        return true;
-                    },
-                    initial_copy: function (msg_obj) {
-                        switch (msg_obj.type) {
-                            case "copy_finished":
-                                my.fun.websocket_safe_send(PL.util.create_message("ack_copy"));
-                                PL.util.is_connected = function() {return true;};
-                                my.fun.connection_state_change(msg_obj, 'connected');
-                                break;
-                            case "transaction": 
-                                (function() {
-                                    var T = PL.modules.mkTransaction({msg: msg_obj, is_remote: true});
-                                    T.apply();
-                                })();
-                                break;
-                           default:
-                                return false;
+                               return false;
                         };
                         return true;
                     },
                     connected: function (msg_obj) {
-                        console.log("STUB: handle_incoming_msg.connected got " + JSON.stringify(msg_obj));
+                        // In the connected state, we will decide what to do with the object based on the 
+                        // 'type' field. The default is to pass the message to the user callback.
+                        if (!('type' in msg_obj)) return false;
+                        switch (msg_obj['type']) {
+                            case 'transaction':
+                                // STUB
+                                break;
+                            case 'acked_message':
+                                // STUB
+                                break;
+                            default:
+                                my.cb.fire_async('participant_message', [msg_obj]);
+                        };
+                        return true;
                     }
                 }   // end handle_incoming_msg
             }       // end fun
         };          // end my
         my.fun.handle_incoming_msg.current = my.fun.handle_incoming_msg.idle;
-
-        // default error handler function, override this!
-        my.cb.set_user_cb("error", function() {
-            var i;
-            console.log(PL.util.get_timestamp() + " - error: " + (arguments[0] || "") + " " + arguments.length + " arguments:");
-            for (i = 0; i < arguments.length; i++) console.dir(arguments[i]);
-        });
-
+        // Register callbacks
         // handle incoming message from server
         my.cb.set_internal_cb("ws_onopen", function () {
-            my.fun.websocket_safe_send(PL.util.create_message("client_connect"));
+            my.fun.websocket_safe_send({type: "client_connect"});
             // We don't want users hooking into ws_onopen.
             // Use the 'connection_state_change' event instead.
             return {skip_user_cb: true};
@@ -824,7 +838,6 @@ var mkPostlock = function (websocket_url) {
             } catch (e) {
                 my.cb.fire("error", ["parsing", e, msg]);
             }
-            // apply server transformation
             if (t !== null)  {
                 try {
                     ret = my.fun.handle_incoming_msg.current(t);
@@ -848,7 +861,43 @@ var mkPostlock = function (websocket_url) {
             // TODO: attempt to handle the error
             console.log("ws_error fired, arguments: " + PL.util.args2array(arguments));
         });
-    
+        // return exports
+        return {
+            connect: my.fun.connect,
+            send: my.fun.send,
+            disconnect: my.fun.disconnect,
+            is_connected: function() {my.state === "connected";},
+            cb: my.cb // note: shouldn't be passed to the user
+        };
+    }; // MkGatewayConnection
+
+
+    //  -------------------------
+    //  - MAIN TELEPATHY MODULE -
+    //  -------------------------
+    PL.modules.mkMain = function (spec) {
+
+        // MODULE FIELDS
+        var exports = {}, 
+            cb = PL.modules.mkCallbackManager({
+                name:"main postlock object",
+                return_this: exports}),
+            my = {
+                exports: exports,
+                cb: cb,
+                connection: PL.modules.mkGatewayConnection({
+                    cb: cb, 
+                    url: spec.url,
+                    password: spec.password,
+                    username: spec.username})
+            }; // end my
+            // default error handler function, override this!
+        my.cb.set_user_cb("error", function() {
+            var i;
+            console.log(PL.util.get_timestamp() + " - error: " + (arguments[0] || "") + " " + arguments.length + " arguments:");
+            for (i = 0; i < arguments.length; i++) console.dir(arguments[i]);
+        });
+   
         // CREATE meta-object
         PL.objects.set("meta_object", PL.modules.mkMetaObject({cb: my.cb}));
         
@@ -873,19 +922,17 @@ var mkPostlock = function (websocket_url) {
         };
  
         // EXPORTS:
-        var exports = {
-            // ---- exports methods ----
-            is_connected: function() {return PL.util.is_connected();},
-            connect: function () {
-                PL.connection=new WebSocket("ws://" + PL.config.ws_url);
-                // Set callbacks for websocket events.
-                PL.connection.onopen=my.cb.wrap_signal("ws_onopen");
-                PL.connection.onmessage=my.cb.wrap_signal("ws_onmessage");
-                PL.connection.onclose=my.cb.wrap_signal("ws_onclose");
-                PL.connection.onerror=my.cb.wrap_signal("ws_onerror");
-                return exports;
-                },
-            disconnect: function () {},
+        PL.util.shallow_copy({
+            // ---- connection methods ----
+            connect: function() {my.connection.connect(); return my.exports;},
+            disconnect: function() {my.connection.disconnect(); return my.exports;},
+            is_connected: my.connection.is_connected,
+            // ---- session information ----
+            session_id: function() {return PL.config.session_id;},
+            participant_id: function() {return PL.config.participant_id;},
+            // ---- inter-participant messages ----
+            send: function(message) {my.connection.send(message); return my.exports;},
+            // ---- exported methods ----
             set_cb: my.cb.set_user_cb,
             make_data: function (initial_value, transaction) {
                 var spec = PL.util.create_spec('data');
@@ -900,9 +947,10 @@ var mkPostlock = function (websocket_url) {
                 return PL.modules.mkTransaction().exports;
             }
             // make_list
-        };
+        }, my.exports);
+
         // RETURN EXPORTS
-        return exports;
+        return my.exports;
     }; // END of module Main
 
     // ---- Postlock object creation ----
@@ -912,6 +960,6 @@ var mkPostlock = function (websocket_url) {
     PL.counters.object_id = PL.modules.mkCounter();
     PL.counters.client_message_id = PL.modules.mkCounter();
     PL.counters.last_server_msg_id = 0;
-    var main = PL.modules.mkMain();
+    var main = PL.modules.mkMain(spec);
     return main;
 }; // END mkPostlock

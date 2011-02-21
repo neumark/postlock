@@ -16,10 +16,10 @@
             Value = element(FieldNo, Instance),
             { case Value of 
                   undefined -> Json;
-                  _ -> json:obj_store(FieldName, Value, Json)
+                  _ -> json:obj_store(erlang:atom_to_list(FieldName), Value, Json)
               end, FieldNo + 1}
         end,
-        {json:obj_new(), 1},
+        {json:obj_new(), 2},
         record_info(fields, Record_name)))).
 
 %%% ----------------------------------------------------------

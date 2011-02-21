@@ -5,52 +5,111 @@
 <script type="text/javascript" src="http://localhost:8081/qunit.js"></script>
 <script type="text/javascript" src="http://localhost:8081/postlock.js"></script>
 <script type="text/javascript">
+var backend_url = "ws://" + document.location.href.slice(7) + "backend.yaws";
 
-
-// from QUnit docs
 $(document).ready(function(){
-    
-test("a basic test example", function() {
-  ok( true, "this test is fine" );
-  var value = "hello";
-  equals( "hello", value, "We expect value to be hello" );
-});
+module("connection");
 
-module("Module A");
+    // If we give the postlock server the wrong password,
+    // the server should drop the websocket connection.
+    test("bad password", function() {
+      var cb_invocation = 0;
+      expect(2);
+      stop();
+      mkPostlock({
+        url: backend_url, 
+        username: 'test_user_1', 
+        password: 'test_user_2'}).set_cb('connection_state_change', 
+            function(oldstate, newstate, msg) {
+                cb_invocation++;
+                if (cb_invocation === 1) ok(oldstate === 'idle' && newstate === 'auth', 'idle->auth');
+                if (cb_invocation === 2) ok(oldstate === 'auth' &&  newstate === 'idle', 'auth->idle');
+            }).set_cb('ws_onclose', function() {
+                start();
+            }).connect();
+    });
 
-test("first test within module", function() {
-  ok( true, "all pass" );
-});
+    // For a successful connection, we should end up in the 'connected' state
+    // and our session_id and participant_id should be set.
+    test("success", function() {
+      var cb_invocation = 0;
+      expect(4);
+      stop();
+      var postlock = mkPostlock({
+        url: backend_url, 
+        username: 'test_user_1', 
+        password: 'test_user_1'}).set_cb('connection_state_change', 
+            function(oldstate, newstate, msg) {
+                cb_invocation++;
+                if (cb_invocation === 1) ok(oldstate === 'idle' && newstate === 'auth', 'idle->auth');
+                if (cb_invocation === 2) {
+                    ok(oldstate === 'auth' &&  newstate === 'connected', 'auth->connected');
+                }
+            }).set_cb('connected', function() {
+                    ok(typeof postlock.participant_id() === "number" && postlock.participant_id() > 0, 'valid participant id');
+                    ok(typeof postlock.session_id() === "number" && postlock.session_id() >= 0, 'valid session id');
+                    start();
+            }).connect();
+    });
 
-test("second test within module", function() {
-  ok( true, "all pass" );
-});
+module("messages");
 
-module("Module B");
+    // client to client messages are tested by connected two clients to the session, then
+    // sending messages between them.
+    test("message delivery", function() {
+        var o, i, users = [
+            {postlock: null, sent: "the first mesage", connected:false, received: ""},
+            {postlock: null, sent: "the reply", connected: false, received:""},
+            ],
+            get_peer_id = function(myid) {return (myid + 1) % users.length;},
+            send_messages = function() {
+                var i = 0, recipient;
+                for (; i < users.length; i++) {
+                    recipient = users[get_peer_id(i)].postlock.participant_id();
+                    users[i].postlock.send({
+                        to: recipient,
+                        type: 'msg',
+                        body: users[i].sent});
+                }
+            },
+            test_messages = function() {
+                var i = 0, recipient_ix;
+                for (; i < users.length; i++) {
+                    recipient_ix = get_peer_id(i);
+                    equal(users[recipient_ix].received, users[i].sent, "user "+i+"'s message was received by user "+recipient_ix);
+                }
+                start();
+            };
+        for (i = 0; i < users.length; i++) {
+            (function(o) {
+                o.postlock = mkPostlock({
+                    url: backend_url, 
+                    username: 'user_'+i, 
+                    password: 'user_'+i}).set_cb(
+                  'connected', function() {
+                      var i=0, result = true;
+                      o.connected = true;
+                      for (;i < users.length;i++) result = result && users[i].connected;
+                      if (result) send_messages();
+                  }).set_cb(
+                  'participant_message', function(msg) {
+                      var i=0, result = true;
+                      o.received = msg.body;
+                      for (;i < users.length;i++) result = result && users[i].received.length > 0;
+                      if (result) test_messages();
+                  }).connect(),
 
-test("some other test", function() {
-  expect(2);
-  equals( true, false, "failing test" );
-  equals( true, true, "passing test" );
-});
-
-  });
-
-var postlock = mkPostlock(document.location.href.slice(7) + "backend.yaws");
-postlock.set_cb('connection_state_change', function(oldstate, newstate, message) {
-    console.log("State changed: " + oldstate + " -> " + newstate + " message: " +JSON.stringify(message));
-    if (postlock.is_connected()) {
-        console.log("Postlock has connected!");
-        try {
-            var v = postlock.make_data({value: 1});
-            console.dir(v);
-        //  v.set(2);
-        } catch (e) {
-            console.log(e.stack);
+                o.on_message = function(msg) {
+                    equal(msg, peer.sent, "user " + i + " got peer's message");};
+                o.on_connect = function() {
+                    
+                }
+            })(users[i]);
         }
-    }
-});
-postlock.connect();
+        expect(users.length);
+        stop();
+    });
+}); // ready()
 </script>
 </head>
 <body>

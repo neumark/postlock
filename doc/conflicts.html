@@ -1,0 +1,205 @@
+<html>
+<body>
+<h1>State synchronization in postlock</h1>
+<p>
+Postlock participants (both client and server) maintain their own copy of shared state, allowing them to perform any operation locally.
+This allows developers to create extremely responsive collaborative applications and frees them from the burden of locking
+shared objects.<br />
+
+Note that it is possible to simply poll the postlock state server for the value of an object, so keeping a local copy of state is not 
+mandatory. This functionality is useful for building interfaces to languages with request-based execution models (eg. php) but normal
+participants have much to loose by taking this route.<br />
+
+Since each participant can perform any operation independently, their copies of shared state will gradually diverge until the next synchronization with the server.
+The operations a participant P1 applies to its local state cannot be run by the server in their original form if another participant P2 has modified the
+same object in the meantime. In most cases, P1's message can be salved by an <b>operational transform</b>, requiring no action on P1's part.
+</p>
+<h2>A synchronization example</h2>
+<p>
+The <a href="svg/synchronization1.svg">following diagram</a> is a simple example for synchronization in postlock.
+<center>
+<object data="svg/synchronization1.svg" type="image/svg+xml" width="800" height="800"></object>
+</center>
+Some vocabulary:
+<dl>
+<dt>common state</dt><dd>State stored by the postlock state server. Always has an id which is a nonnegative integer (no dot).</dd>
+<dt>proposed state</dt><dd>State of a local participant after a local operation has run.</dd>
+<dt>transaction</dt><dd>A set of operations which move state between versions. Transactions have the following properties:
+            <ul>
+                <li>If any of the operations fails, postlock will return to the starting state.</li>
+                <li>Transactions are deterministic: their success or failure must be determined by the shared state alone.</li>
+            </ul>
+</dd>
+<dt>participant</dt><dd>Any process in the postlock session which can send messages to the other participants. Every browser connecting through <em>postlock.js</em> is a participant, but so is the state server for example.</dd>
+<dt>postlock client</dt><dd>A postlock participant running on the end user's hardware (eg. postlock.js running in a browser).</dd>
+<dt>postlock server</dt><dd>The message passing and state synchronization part of postlock. Participants which run on the server are not considered part of the postlock server.</dd>
+</dl>
+
+In the example illustrated by the diagram above, the following actions take place:
+<ol>
+    <li>Client A deletes 'b' from the list.</li>
+    <li>Client B moves 'b' to the first place in the list.</li>
+    <li>The server instructs client B to delete 'b' from the list.</li>
+</ol>
+Each time a client applies an operation locally, it informs the state server of how to reach the resulting state through a transaction message. 
+The participant's post-operation state is a proposed state since it has not yet been acknowledged by the postlock server. Proposed states
+have a version number of <b>X.Y</b> where X is the initial common state (a state which has been acknowledged by the server), and Y is the 
+number of modifications made since the common state (since it's possible to run several operations before feedback for the first operation arrives).
+In our particular example, the first action will result in the following message sent from client A to the server:
+<pre>
+{
+    from: 2, // [client A is participant 2]
+    to: 1,   // [the state server is participant 1]
+    type: 'transaction',
+    body: {
+        tid: '0:0.1',
+        ops: [
+            ['delete', 1]
+        ]
+    }
+}
+</pre>
+Since the server is currently in state 0, it can apply client A's transaction, which will move it to the proposed state 0.1. Now that the server
+is also in this state it becomes the next acknowledged state, 1. The server respond's to A's message as follows:
+<pre>
+{
+    from: 1,
+    to: 2,
+    type: 'transaction',
+    body: {
+        tid: '0.1:1',
+        ops: [],
+        results: [
+            {op: ['delete', 1], result: 1} // 1 == applied
+        ]
+    }
+}
+</pre>
+The meaning of this message is: client A's current state (0.1) has been acknowledged by the server as common state 1. The <em>ops</em> 
+field is empty, since no addition action must be taken by client A to reach common state 1. The <em>results</em> field is optional 
+and can be safely ignored. It informs the participant how each operation in its transaction was applied. The server notifies client B of
+the new common state:
+<pre>
+{
+    from: 1,
+    to: 3, // [client B is participant 3]
+    type: 'transaction',
+    body: {
+        tid: '0:1',
+        ops: [['delete', 1]],
+    }
+}
+</pre>
+</p>
+<p>
+While Client A is sending it's transaction to the server, client B also changes its state. By the time it get's the state server's
+message moving it from common state 0 to common state 1, B's state is already at the proposed 0.1. Note that proposed states are not unique:
+B's 0.1 is achieved by by moving 'b' to the front of the list - quite different from A's 0.1. Since B's state has advanced past state
+0 (which is the starting state for the message above), the server's transaction is discarded. <br />
+After performing its move operation, client B sends the server a transaction which describes <em>its</em> proposed 0.1 state:
+<pre>
+{ 
+    from: 3, // [client B is participant 3]
+    to: 1,   // [the state server is participant 1]
+    type: 'transaction',
+    body: { 
+        tid: '0:0.1',
+        ops: [
+            ['move', 1, 0]
+        ]
+    }
+}
+</pre>
+When the server gets this message, it sees that the transaction's starting state is 0, meaning it has not yet received (or discarded) the
+transaction "0:1". Any parameters in the operations are valid for common state 0. It also notices that the move operation references an
+element no longer present in state 1 (b).<br />
+There's no way it could run A's transaction and then B's. But it <em>could</em> B's first, and then A's. The server pretends that this
+is exactly what happened: After executing B's move operation, it runs A's transformed delete, resulting in the common state 1. Since client A is already
+in the common state 1, there's no need to inform it of B's transaction. The server sends the following message to B:
+<pre>
+{ 
+    from: 1, 
+    to: 3,   
+    type: 'transaction',
+    body: { 
+        tid: '0.1:1',
+        ops: [
+            ['delete', 0]
+        ],
+        results: [
+            {op: ['move', 1, 0], result: 2} // 1 == masked
+        ]
+    }
+}
+</pre>
+Note that the delete command takes list position 0 as its parameter, not 1 as it did in client A's message. The server ran the operational transform
+on A's transaction after it applied B's transaction (at least thats what client B sees). Since B moved the list element 'b' to the front fo the list,
+A's operation has to be adjusted accordingly. When B gets this message, it will execute the delete, bringing it to the common state 1. In the results
+section, the result code 2 for the move operation informs client B that although technically there was nothing wrong with its operation, an operation
+from another client masked the resulting, so other participants never recieved the 'move' from the postlock server.<br />
+If for some reason the application logic requires B to place the element 'b' at the front of the list, it can 'insert' it at position 0 and
+send transaction "1:1.1" to the server.
+</p>
+
+<h2>Multiple proposed states</h2>
+In the example above, only a single proposed state was reached before the server could issue a response to the clients. In practice it can often
+be the case that the user performs several operations in quick succession before the first one is acknolwedged by the server. In this case, the
+client will always send transactions which move the server from the last common state to the last proposed state. For example, let's say the
+user executes the following 3 operations on list [a,b,c] (which is in common state 0):
+<ol>
+<li>delete(0) -&gt; [b,c]</li>
+<li>move(1,0) -&gt; [c,b]</li>
+<li>insert(1,'f') -&gt; [c,f,b]</li>
+</ol>
+The client would send the postlock server the following three messages:
+<pre>
+{ 
+    from: 2, 
+    to: 1, 
+    type: 'transaction',
+    body: { 
+        tid: '0:0.1',
+        ops: [
+            ['delete', 0]
+        ]
+    }
+}
+
+{ 
+    from: 2, 
+    to: 1, 
+    type: 'transaction',
+    body: { 
+        tid: '0:0.2',
+        ops: [
+            ['delete', 0],
+            ['move', 1, 0]
+        ]
+    }
+}
+
+{ 
+    from: 2, 
+    to: 1, 
+    type: 'transaction',
+    body: { 
+        tid: '0:0.3',
+        ops: [
+            ['delete', 0],
+            ['move', 1, 0],
+            ['insert', 1, 'f'],
+        ]
+    }
+}
+</pre>
+The server receives each message and sends an appropriate response, but it will be discarded by the client which has moved on to a latter 
+state by that point. If the first transaction is successful, and delete(0) run successfully, then the server will move its state from common
+state 0 to 1. When the next transaction arrives ("0:0.2"), the server will notice that its state is newer than the starting state of the 
+transaction, so it will apply an operational transform, resulting in the following operations:
+<pre>
+            ['noop'],           // this has already been applied: OT results in no operation
+            ['move', 1, 0]      // no modification necessary as client and server states match at this point
+</pre>
+Eventually, the client will stop spewing transactions, so the server's response transaction will have the same starting state that the client is in.
+After running this transaction, the client will be in a common state (in our case state 3).
+</body></html>

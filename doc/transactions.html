@@ -1,0 +1,347 @@
+<html>
+<head>
+<title>Transactions in postlock</title>
+</head>
+<body>
+<h1>Transactions in postlock</h1>
+<h2>Terms used in this document</h2>
+This document relies on terms introduced in <a href="conflicts.html">conflicts.html</a>.<br />
+<dl>
+<dt>oid</dt><dd>Abbreviation of Object IDentity. A simple string with the format of "X.Y", where both X and Y are nonnegative integers. 
+X is the id of the participant which created the object, while Y is a counter. OID's are guaranteed to be unique. </dd>
+</dl>
+<h2>Scope of this document</h2>
+This document describes the process by which a postlock participant can modify shared state.
+Emphasis is placed on the operational transform, which allows the server to run out of date transactions
+unless they come into conflict with later transactions. Most of the examples in this file follow the simple template
+of 
+<ol>
+<li>Client A sends the server a transaction.</li>
+<li>Client B sends the server a transaction.</li>
+<li>The server gets A's transaction, applies it, and notifies both clients (B discards the server's message, since
+it no longer applies in B's current state).</li>
+<li>The server gets B's transaction which is based on one state prior to the server's current state. It applies 
+the operational transform to the message and -if successful- runs the resulting modified operations.</li>
+</ol>
+This is the <em>simplest</em> scenario in which operational transformations are necessary. More complex situations
+are handled the same way (for example if several clients send transactions to the server before B's message arrives).
+Generally OT is needed when the state server receives transactions with a starting state older than that state
+server's current state. In the template above, the difference between the transaction's start state and the
+state server's state is a single transaction. When the start state is several transactions behind the state server's
+current state, then the postlock server applies the steps used in the following examples for each transaction. Thus,
+the multiple transaction OT is simply a chain of OT's applied in sequence for each transaction which the sender of the
+outdated transaction has not yet applied.
+<h2>Operations in postlock</h2>
+Shared state is a tree-like collection of postlock's managed data types (currently lists, dictionaries and data).
+Each managed type has its own set of applicable operations.<br />
+Changes are distributed among participants as <em>transactions</em>, which contain a list of <em>operations</em>.
+Certain operations are guaranteed to be applicable in any state: for example, creating a new object of any type
+will always work. Most operations either outright fail or require a transformation if another user applies the wrong
+operations first. Examples:
+<h3>Example 1: transaction failure in order to avoid data loss</h3>
+The following example shows how operations which lead to data loss fail by default, preventing dangerous writes.
+Let's assume a <code>data</code> object, with oid <code>0.0</code> exists, its contents initially set to <code>null</code>.
+<ol>
+    <li>Client A sets the state to be <code>1</code> with the following message:
+        <pre>
+            {
+                from: 2 // Client A is 2
+                to: 1   // the state server is 1
+                type: transaction
+                body: {
+                    tid: "0:0.1",
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "set",
+                        params: [1] // 'set' takes only one parameter, the new value.
+                    }]
+                }
+            }
+        </pre>
+    </li>
+    <li>Just as A's transaction reaches the state server, client B sends an operation which
+        modifies the same object, but gives it a different value:
+        <pre>
+            {
+                from: 3 // Client B is 3 
+                to: 1   // the state server is 1
+                type: transaction
+                body: {
+                    tid: "0:0.1",
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "set",
+                        params: [2]
+                    }]
+                }
+            }
+        </pre>
+    </li>
+    <li>The state server gets A's message first, applies it, and notifies both clients. Naturally, B will 
+        discard the message, since its state is no longer in 0 (the starting state for the transaction).
+        Then, the state server gets B's message. It can see that B's message is slightly out of date, since
+        the state server is in state 1 now, while B's transaction advances state only to 0.1.
+    </li>
+    <li>
+        The state server transforms each operation in B's transaction to be applicable in its current state.
+        The last transaction that touched object "0.0" in the state server is "0:1". B's transaction is
+        "0:0.1", Since the ending state of B's transaction is older than the state of object in the state server,
+        we know someone else has changed the object without B's knowledge. Allowing B's 'set' to continue
+        would result in data loss.  As a result, B's set will fail.
+    </li>
+    <li>
+        The state server must notify B of the transaction's outcome. It will construct a message that takes
+        B's state back to 0, then on to 1 (undoing B's 0.1 state). A slight optimization is possible: instead
+        of undoing <em>all</em> operations, only the operations not overridden by applied transactions are
+        undone. In our example, the single operation 'set' is in fact overridden, so the state server issues
+        a single set with the new value:
+        <pre>
+            {
+                from: 1
+                to: 3
+                type: transaction
+                body: {
+                    tid: "0.1:1",
+                    result: {
+                        ok: false,
+                        failed_op: 0,
+                        reason: 102     // just an example error code, meant to indicate "out of date"
+                    },
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "set",
+                        params: [1]
+                    }]
+                }
+            }
+        </pre>
+    </li>
+    <li>
+        Upon receiving the state server's response to its transaction, client B has two options. It can either
+        decide to dicard its transaction, keeping "0.0" state 1. The other option is to re-run the transaction.
+        Since B's state has been moved to 1, the transaction it now sends to the server will have a tid of "1:1.1",
+        which will override client A's original transaction. The correct choice is determined by the application's
+        logic, there is no innately correct action.
+    </li>
+</ol>
+<h3>Example 2: failure due to conflict</h3>
+Some transactions will fail because the operational transform is not possible. The following example demonstrates such a case.
+The operations in this example will be applied on a <code>list</code> object (oid: 0.0) with initial value <code>["0.5", "0.1"]</code>.
+Note: postlock lists only contain references to other postlock objects, no actual user data is present in a list directly.
+<ol>
+    <li>
+        Client A sends the server a transaction which deletes both elements in the list:
+        <pre>
+            {
+                from: 2,
+                to: 1,
+                type: transaction
+                body: {
+                    tid: "0:0.1",
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "remove",
+                        params: [1]
+                    },
+                    {
+                        oid: "0.0",
+                        cmd: "remove",
+                        params: [0]
+                    }]
+                }
+            }
+        </pre>
+    </li>
+    <li>Client B sends the server a transaction in which it attempts to append data object (oid: 3.7) to the list. Although
+        the javascript API may expose an <code>append(item)</code> function, an <code>insert</code> command is
+        sent in the transaction.
+        <pre>
+            {
+                from: 3,
+                to: 1,
+                type: transaction
+                body: {
+                    tid: "0:0.1",
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "insert",
+                        params: [2, "3.7"]
+                    }]
+                }
+            }
+        </pre>
+    </li>
+    <li>The usual step 3: the server receives and applies A's message, informs both clients (but B discards the message). 
+        Then the server gets B's message, on which it must apply OT to make it applicable in the current state.
+        The OT will try to map the old position 2 to a list to its new position. This will fail, as the lists length is
+        currently 0.
+    </li>
+    <li>
+        The state server must notify B of the transaction's outcome. The server's reply will
+        undo B's <code>insert</code>, which moves B back to state 0, and the delete list items 1 and 2,
+        which advances B's state to 1:
+        <pre>
+            {
+                from: 1
+                to: 3
+                type: transaction
+                body: {
+                    tid: "0.1:1",
+                    result: {
+                        ok: false,
+                        failed_op: 0,
+                        reason: 103     // just an example error code, meant to indicate "no such list position"
+                    },
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "remove",
+                        params: [2]
+                    },
+                    {
+                        oid: "0.0",
+                        cmd: "remove",
+                        params: [1]
+                    },
+                    {
+                        oid: "0.0",
+                        cmd: "remove",
+                        params: [0]
+                    }]
+                }
+            }
+        </pre>
+        Note: removing elements starting from the back of the list and moving towards the front is pretty straight forward. It's also possible to
+        move in the opposite direction, this would require remove(0) operations. Although they look identical, each of them would remove a different
+        element in the list.<br />
+        Another thing to note: in practice, B's insert of object 3.7 will often be preceded by the creation of object 3.7. By placing the create and
+        the insert in a single transaction, the rollback of the transaction (due to the insert's failure) will guarantee that the state space is
+        not polluted with unused objects.
+    </li>
+</ol>
+<h3>Example 3: Successfully applied OT</h3>
+The following example demonstrates the flow of messages among postlock participants when one of the transactions received
+by the state server is out of date and thus requires OT to be applied to the current state. The clients in this example
+will operate on a <code>list</code> (oid: 0.0), with the initial value of ["1.1"].
+
+<ol>
+<li>Client A prepends item 2.1 to the list:
+        <pre>
+            {
+                from: 2,
+                to: 1,
+                type: "transaction",
+                body: {
+                    tid: "0:0.1",
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "insert",
+                        params: [0, "2.1"]
+                    }]
+                }
+            }
+        </pre>
+</li>
+<li>Client B appends an item (oid: 3.1) to the list:
+        <pre>
+            {
+                from: 3,
+                to: 1,
+                type: "transaction",
+                body: {
+                    tid: "0:0.1",
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "insert",
+                        params: [1, "3.1"]
+                    }]
+                }
+            }
+        </pre>
+</li>
+<li> The state server receives both messages. As a response to the first message, the state server sends
+the following transactions:
+    <pre>
+            { // Acknowledgement of A's transaction.
+                from: 1,
+                to: 2, 
+                type: "transaction",
+                body: {
+                    tid: "0.1:1",
+                    result: {
+                        ok: true,
+                    },
+                    ops: []
+                }
+            }
+
+            { // Note: this message will be discarded by B.
+                from: 1,
+                to: 3, 
+                type: "transaction",
+                body: {
+                    tid: "0:1",
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "insert",
+                        params: [0, "2.1"]
+                    }]
+                }
+            }
+ 
+    </pre>
+</li>
+<li>Since the B's transaction has a start state of 0 and the state server's curernt state is 1, the server
+will apply OT to the insert within B's transaction. Since the difference between the transaction's start state
+(0) and the state server's current state (1) is an insert(0, ...) operation, any list positions in B's message
+which are &gt; 0 must be incremented by 1.
+<pre>
+                        params: [1, "3.1"]  =&gt; params: [2, "3.1"]
+                        state 2 for object 0.0: ["2.1", "1.1", "3.1"]
+</pre>
+</li>
+<li>
+The state server must notify both clients that B's transaction was successfully applied. It send B and acknowledgement of its transaction
+and also re-transmit A's transaction so B will arrive in state 2. A will receive a transformed version of B's transaction which can
+be applied in state 1:
+<pre>
+            {
+                from: 1,
+                to: 3,
+                type: "transaction",
+                body: {
+                    tid: "0.1:2",
+                    result: {
+                        ok: true,
+                    },
+                    ops: [{         // note: in state 0.1, B's version of the list is ["1.1", "3.1"]
+                        oid: "0.0",
+                        cmd: "insert",
+                        params: [0, "2.1"]
+                    }]
+                }
+            }
+
+            {
+                from: 1,
+                to: 2,
+                type: "transaction",
+                body: {
+                    tid: "1:2",
+                    ops: [{
+                        oid: "0.0",
+                        cmd: "insert",
+                        params: [2, "3.1"]
+                    }]
+                }
+            }
+</pre>
+How did the state server construct the reply sent to B? In order to bring B up to state 2, A's transaction must be applied,
+but B can't apply it in it's original form, since B's state is 0.1, not 0 (the starting state of A's transaction). Again,
+the state server must perform an OT which makes A's transaction applicable in B's 0.1 state.<br />
+B's 0.1 state differs from state 0 by the <code>insert(1, "3.1")</code> (note that this is the operation applied by B locally,
+not the version applied by the state server). Since list positions &lt; 1 are not affected, A's transaction needs no modification,
+it can be sent as is.
+</li>
+</ol>
+</body>
+</html>
